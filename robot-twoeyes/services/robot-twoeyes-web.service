@@ -1,0 +1,16 @@
+[Unit]
+Description=Robot TwoEyes Frontend (Vue Dev Server)
+After=network.target robot-twoeyes.service
+Wants=robot-twoeyes.service
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/Documents/yx/project/robot-twoeyes/frontend
+Environment="PATH=/home/unitree/.nvm/versions/node/v24.16.0/bin:/home/unitree/miniconda3/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=/home/unitree/.nvm/versions/node/v24.16.0/bin/npx vite --host
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

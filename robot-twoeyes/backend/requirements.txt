@@ -1,0 +1,8 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+websockets>=12.0
+opencv-python-headless>=4.9
+numpy>=1.24
+pyzmq>=25.0
+requests
+logging-mp==0.1.6

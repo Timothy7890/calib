@@ -1,0 +1,16 @@
+[Unit]
+Description=YOLO Detection API Server
+After=network.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/Documents/yx/project/robot-twoeyes
+Environment="PATH=/home/unitree/miniconda3/envs/yolo/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="LD_LIBRARY_PATH=/home/unitree/miniconda3/envs/yolo/lib"
+ExecStart=/home/unitree/miniconda3/envs/yolo/bin/python img_process/yolo/run_server.py --model img_process/yolo/model/XiongMao1.onnx --class-names XiongMao
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

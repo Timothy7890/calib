@@ -1,0 +1,17 @@
+[Unit]
+Description=Robot TwoEyes Backend (Depth + Calibration)
+After=network.target
+
+[Service]
+Type=simple
+User=unitree
+WorkingDirectory=/home/unitree/Documents/yx/project/robot-twoeyes
+Environment="PATH=/home/unitree/miniconda3/envs/fastapi/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="LD_LIBRARY_PATH=/home/unitree/miniconda3/envs/fastapi/lib"
+Environment="PYTHONPATH=/home/unitree/unitree_eai_environment/service/teleimager/src"
+ExecStart=/home/unitree/miniconda3/envs/fastapi/bin/python depth/run_server.py --calib_path data/calib_images/202605261533/stereo_calibration.yaml
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
