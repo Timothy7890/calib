@@ -36,19 +36,80 @@
         </div>
       </div>
 
-      <div class="panel joints-panel">
+      <div class="panel eye-panel">
         <div class="panel-label">
-          当前右臂关节
-          <span class="detect-dot" :class="{ detected: jointsOk }"></span>
-          <span class="detect-text">{{ jointsOk ? '正常' : (jointsError || '读取中...') }}</span>
+          右眼
+          <span class="detect-dot" :class="{ detected: rightDetected }"></span>
+          <span class="detect-text">{{ rightDetected ? '检测到棋盘格' : '未检测到' }}</span>
         </div>
-        <table class="joints-table">
+        <div class="image-container">
+          <img v-if="rightSrc" :src="rightSrc" class="camera-img" alt="右眼" />
+          <div v-else class="placeholder">等待画面...</div>
+        </div>
+      </div>
+
+      <div class="panel arm-panel" v-if="armAvailable">
+        <div class="arm-header">
+          <h3>右臂点动控制</h3>
+          <span class="arm-state" :class="{ on: armEngaged }">
+            {{ armEngaged ? '已接管(持位中)' : '未接管' }}
+          </span>
+          <span class="arm-state" :class="{ on: armJog }">
+            {{ armJog ? 'jog 已使能' : 'jog 锁定' }}
+          </span>
+          <span class="arm-state warn" v-if="armFloat">手调松力中</span>
+          <div class="arm-buttons">
+            <button v-if="!armJog" class="arm-btn enable" @click="enableArm">
+              {{ armFloat ? '使能 jog(接住)' : '使能 jog' }}
+            </button>
+            <button v-else class="arm-btn disable" @click="disableArm">关闭 jog(保持)</button>
+            <button v-if="!armJog && !armFloat" class="arm-btn handmove" @click="handMoveArm">进入手调(松力)</button>
+            <button class="arm-btn estop" @click="stopArm">急停(冻结)</button>
+          </div>
+        </div>
+        <div v-if="armFloat" class="float-warning">
+          ⚠ 右臂已松力(手调中)— 无重力补偿,请<strong>全程用手托住手臂</strong>!松手会塌下。
+          搬到大致位置后点 <strong>"使能 jog(接住)"</strong> 刚性接管,再用 0.2° 精调。
+        </div>
+        <div class="arm-steprow">
+          <span class="arm-steplabel">微调步距:</span>
+          <button
+            v-for="s in nudgeSteps" :key="s"
+            class="step-btn" :class="{ active: nudgeStep === s }"
+            @click="nudgeStep = s"
+          >{{ s }}°</button>
+        </div>
+        <p class="arm-note">限速 {{ maxSpeedRad.toFixed(2) }} rad/s · 拖动慢速跟随 · 自动夹紧关节限位 · 关闭服务前请托住手臂</p>
+        <table class="arm-table">
+          <thead>
+            <tr><th>关节</th><th>目标 (°)</th><th class="slider-col">调节</th><th>实测 (°)</th><th>微调</th></tr>
+          </thead>
           <tbody>
-            <tr v-for="(name, i) in jointNames" :key="name">
-              <td class="jname">{{ shortName(name) }}</td>
+            <tr v-for="(name, i) in armNames" :key="name">
               <td class="jzh">{{ zhName(name) }}</td>
-              <td class="jval">{{ jointsOk ? fmt(jointsQ[i]) : '—' }}</td>
-              <td class="jdeg">{{ jointsOk ? fmtDeg(jointsQ[i]) : '' }}</td>
+              <td class="jval">
+                <input
+                  type="number" step="0.5" class="deg-input"
+                  :disabled="!armJog"
+                  v-model.number="desiredDeg[i]"
+                  @change="onDesiredChange(i)"
+                />
+              </td>
+              <td class="slider-col">
+                <input
+                  type="range" step="0.5" class="deg-slider"
+                  :disabled="!armJog"
+                  :min="limitsDeg[i] ? limitsDeg[i][0] : -180"
+                  :max="limitsDeg[i] ? limitsDeg[i][1] : 180"
+                  v-model.number="desiredDeg[i]"
+                  @input="onDesiredChange(i)"
+                />
+              </td>
+              <td class="jdeg measured">{{ measuredDeg[i] !== undefined ? measuredDeg[i].toFixed(1) : '—' }}</td>
+              <td class="nudge-cell">
+                <button class="nudge-btn" :disabled="!armJog" @click="nudge(i, -nudgeStep)">−{{ nudgeStep }}°</button>
+                <button class="nudge-btn" :disabled="!armJog" @click="nudge(i, nudgeStep)">＋{{ nudgeStep }}°</button>
+              </td>
             </tr>
           </tbody>
         </table>
@@ -69,73 +130,6 @@
       <span v-if="lastCapture" class="last-capture">
         已存 #{{ lastCapture.index }}: q = [{{ lastCapture.q_rad.map(fmt).join(', ') }}]
       </span>
-    </div>
-
-    <div class="arm-panel" v-if="armAvailable">
-      <div class="arm-header">
-        <h3>右臂点动控制</h3>
-        <span class="arm-state" :class="{ on: armEngaged }">
-          {{ armEngaged ? '已接管(持位中)' : '未接管' }}
-        </span>
-        <span class="arm-state" :class="{ on: armJog }">
-          {{ armJog ? 'jog 已使能' : 'jog 锁定' }}
-        </span>
-        <span class="arm-state warn" v-if="armFloat">手调松力中</span>
-        <div class="arm-buttons">
-          <button v-if="!armJog" class="arm-btn enable" @click="enableArm">
-            {{ armFloat ? '使能 jog(接住)' : '使能 jog' }}
-          </button>
-          <button v-else class="arm-btn disable" @click="disableArm">关闭 jog(保持)</button>
-          <button v-if="!armJog && !armFloat" class="arm-btn handmove" @click="handMoveArm">进入手调(松力)</button>
-          <button class="arm-btn estop" @click="stopArm">急停(冻结)</button>
-        </div>
-      </div>
-      <div v-if="armFloat" class="float-warning">
-        ⚠ 右臂已松力(手调中)— 无重力补偿,请<strong>全程用手托住手臂</strong>!松手会塌下。
-        搬到大致位置后点 <strong>"使能 jog(接住)"</strong> 刚性接管,再用 0.2° 精调。
-      </div>
-      <div class="arm-steprow">
-        <span class="arm-steplabel">微调步距:</span>
-        <button
-          v-for="s in nudgeSteps" :key="s"
-          class="step-btn" :class="{ active: nudgeStep === s }"
-          @click="nudgeStep = s"
-        >{{ s }}°</button>
-      </div>
-      <p class="arm-note">限速 {{ maxSpeedRad.toFixed(2) }} rad/s · 拖动慢速跟随 · 自动夹紧关节限位 · 关闭服务前请托住手臂</p>
-      <table class="arm-table">
-        <thead>
-          <tr><th>关节</th><th>目标 (°)</th><th class="slider-col">调节</th><th>实测 (°)</th><th>微调</th></tr>
-        </thead>
-        <tbody>
-          <tr v-for="(name, i) in armNames" :key="name">
-            <td class="jzh">{{ zhName(name) }}</td>
-            <td class="jval">
-              <input
-                type="number" step="0.5" class="deg-input"
-                :disabled="!armJog"
-                v-model.number="desiredDeg[i]"
-                @change="onDesiredChange(i)"
-              />
-            </td>
-            <td class="slider-col">
-              <input
-                type="range" step="0.5" class="deg-slider"
-                :disabled="!armJog"
-                :min="limitsDeg[i] ? limitsDeg[i][0] : -180"
-                :max="limitsDeg[i] ? limitsDeg[i][1] : 180"
-                v-model.number="desiredDeg[i]"
-                @input="onDesiredChange(i)"
-              />
-            </td>
-            <td class="jdeg measured">{{ measuredDeg[i] !== undefined ? measuredDeg[i].toFixed(1) : '—' }}</td>
-            <td class="nudge-cell">
-              <button class="nudge-btn" :disabled="!armJog" @click="nudge(i, -nudgeStep)">−{{ nudgeStep }}°</button>
-              <button class="nudge-btn" :disabled="!armJog" @click="nudge(i, nudgeStep)">＋{{ nudgeStep }}°</button>
-            </td>
-          </tr>
-        </tbody>
-      </table>
     </div>
 
     <div class="tcp-panel">
@@ -195,6 +189,8 @@ import { ref, computed, onMounted, onUnmounted, watch } from 'vue'
 
 const leftSrc = ref('')
 const leftDetected = ref(false)
+const rightSrc = ref('')
+const rightDetected = ref(false)
 const captureCount = ref(0)
 const showCorners = ref(true)
 const boardSizeInput = ref('11x8')
@@ -245,10 +241,6 @@ function fmt(v) {
 function fmtDeg(v) {
   return `${(Number(v) * 180 / Math.PI).toFixed(1)}°`
 }
-function shortName(name) {
-  return name.replace(/^right_/, '').replace(/_joint$/, '')
-}
-
 const ZH_TOKENS = {
   left: '左',
   right: '右',
@@ -276,6 +268,10 @@ function connectWebSocket() {
     const data = JSON.parse(event.data)
     leftSrc.value = 'data:image/jpeg;base64,' + data.left
     leftDetected.value = data.left_detected
+    if (data.right !== undefined) {
+      rightSrc.value = 'data:image/jpeg;base64,' + data.right
+      rightDetected.value = data.right_detected
+    }
     captureCount.value = data.count
   }
   ws.onclose = () => setTimeout(connectWebSocket, 2000)
@@ -435,9 +431,9 @@ async function pollArm(syncDesired = false) {
     // Sync the sliders from the server only when jog is locked (server owns
     // the target) or on an explicit sync; otherwise the user owns the sliders.
     if ((syncDesired || !data.jog_enabled) && data.desired_rad) {
-      desiredDeg.value = data.desired_rad.map((v) => v * R2D)
+      desiredDeg.value = data.desired_rad.map((v) => +(v * R2D).toFixed(1))
     } else if (desiredDeg.value.length === 0 && data.desired_rad) {
-      desiredDeg.value = data.desired_rad.map((v) => v * R2D)
+      desiredDeg.value = data.desired_rad.map((v) => +(v * R2D).toFixed(1))
     }
   } catch (e) {
     armAvailable.value = false
@@ -505,7 +501,7 @@ onUnmounted(() => {
 
 <style scoped>
 .app {
-  max-width: 1400px;
+  max-width: 1700px;
   margin: 0 auto;
   padding: 20px;
 }
@@ -554,6 +550,7 @@ onUnmounted(() => {
 .main-content {
   display: flex;
   gap: 16px;
+  align-items: flex-start;
   justify-content: center;
   flex-wrap: wrap;
   margin-bottom: 24px;
@@ -563,15 +560,12 @@ onUnmounted(() => {
   border-radius: 12px;
   overflow: hidden;
   border: 2px solid #2a2a4a;
+  display: flex;
+  flex-direction: column;
 }
 .eye-panel {
-  flex: 2;
-  max-width: 720px;
-  min-width: 320px;
-}
-.joints-panel {
-  flex: 1;
-  min-width: 280px;
+  flex: 1 1 0;
+  min-width: 300px;
 }
 .panel-label {
   padding: 8px 16px;
@@ -612,19 +606,6 @@ onUnmounted(() => {
   justify-content: center;
   color: #555;
   font-size: 1.1rem;
-}
-.joints-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-variant-numeric: tabular-nums;
-}
-.joints-table td {
-  padding: 10px 16px;
-  border-bottom: 1px solid #2a2a4a;
-  font-size: 0.95rem;
-}
-.jname {
-  color: #aaa;
 }
 .jzh {
   color: #ddd;
@@ -681,18 +662,20 @@ onUnmounted(() => {
 .arm-panel {
   background: #16213e;
   border-radius: 12px;
-  padding: 16px 20px;
+  padding: 14px 18px;
   border: 1px solid #2a2a4a;
-  margin-bottom: 24px;
+  flex: 0 1 500px;
+  min-width: 460px;
+  align-self: flex-start;
 }
 .arm-header {
   display: flex;
   align-items: center;
-  gap: 16px;
+  gap: 8px 10px;
   flex-wrap: wrap;
 }
 .arm-header h3 {
-  font-size: 1.05rem;
+  font-size: 1rem;
   color: #00d4ff;
   margin: 0;
 }
@@ -712,15 +695,16 @@ onUnmounted(() => {
   color: #ffb74d;
 }
 .arm-buttons {
-  margin-left: auto;
   display: flex;
-  gap: 10px;
+  flex-wrap: wrap;
+  gap: 8px;
 }
 .arm-btn {
-  padding: 8px 18px;
+  padding: 6px 13px;
   border: none;
   border-radius: 8px;
   font-weight: 600;
+  font-size: 0.85rem;
   cursor: pointer;
   color: #fff;
 }
@@ -776,20 +760,32 @@ onUnmounted(() => {
 }
 .arm-table th {
   text-align: left;
-  font-size: 0.8rem;
+  font-size: 0.78rem;
   color: #888;
   font-weight: 500;
-  padding: 6px 12px;
+  padding: 5px 6px;
   border-bottom: 1px solid #2a2a4a;
 }
 .arm-table td {
-  padding: 8px 12px;
+  padding: 5px 6px;
   border-bottom: 1px solid #22223a;
 }
-.slider-col { width: 40%; }
-.deg-slider { width: 100%; accent-color: #00d4ff; }
+.arm-table .jzh {
+  white-space: nowrap;
+  width: 100%;
+}
+.slider-col { width: 150px; }
+.deg-slider {
+  width: 150px;
+  max-width: 100%;
+  accent-color: #00d4ff;
+  vertical-align: middle;
+}
+.arm-table .jval,
+.arm-table .measured,
+.arm-table .nudge-cell { white-space: nowrap; }
 .deg-input {
-  width: 80px;
+  width: 62px;
   padding: 4px 6px;
   border: 1px solid #555;
   border-radius: 4px;

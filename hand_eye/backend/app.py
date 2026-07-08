@@ -50,6 +50,7 @@ def init_state() -> None:
     """Create directories and sync the capture counter. Call after injection."""
     global capture_count
     (save_path / "left").mkdir(parents=True, exist_ok=True)
+    (save_path / "right").mkdir(parents=True, exist_ok=True)
     (save_path / "joints").mkdir(parents=True, exist_ok=True)
     (save_path / "tcp").mkdir(parents=True, exist_ok=True)
     capture_count = _count_existing_captures()
@@ -119,15 +120,19 @@ async def ws_stream(ws: WebSocket):
     recv_task = asyncio.create_task(receive_commands())
     try:
         while True:
-            left = await asyncio.to_thread(camera.grab_left, 2.0)
-            if left is None:
+            pair = await asyncio.to_thread(camera.grab_pair, 2.0)
+            if pair is None:
                 await asyncio.sleep(0.3)
                 continue
-            detected, display = detect_corners(left, local_board_size, draw=show_corners)
+            left, right = pair
+            left_detected, left_disp = detect_corners(left, local_board_size, draw=show_corners)
+            right_detected, right_disp = detect_corners(right, local_board_size, draw=show_corners)
             payload = json.dumps(
                 {
-                    "left": encode_jpeg(display),
-                    "left_detected": detected,
+                    "left": encode_jpeg(left_disp),
+                    "right": encode_jpeg(right_disp),
+                    "left_detected": left_detected,
+                    "right_detected": right_detected,
                     "count": capture_count,
                 }
             )
@@ -165,9 +170,10 @@ async def api_capture():
     """Capture left image + joints atomically under the same index."""
     global capture_count
 
-    left = await asyncio.to_thread(camera.grab_left, 3.0)
-    if left is None:
+    pair = await asyncio.to_thread(camera.grab_pair, 3.0)
+    if pair is None:
         return JSONResponse({"success": False, "error": "No camera frame available"}, status_code=503)
+    left, right = pair
 
     try:
         q = await asyncio.to_thread(joint_provider.read)
@@ -182,11 +188,15 @@ async def api_capture():
         return JSONResponse({"success": False, "error": f"Non-finite joints: {q_arr}"}, status_code=500)
 
     idx_str = f"{capture_count:04d}"
-    img_file = save_path / "left" / f"{idx_str}.jpg"
+    left_file = save_path / "left" / f"{idx_str}.jpg"
+    right_file = save_path / "right" / f"{idx_str}.jpg"
     joints_file = save_path / "joints" / f"{idx_str}.json"
 
-    if not cv2.imwrite(str(img_file), left):
-        return JSONResponse({"success": False, "error": "Failed to write image file"}, status_code=500)
+    if not cv2.imwrite(str(left_file), left):
+        return JSONResponse({"success": False, "error": "Failed to write left image file"}, status_code=500)
+    if not cv2.imwrite(str(right_file), right):
+        left_file.unlink(missing_ok=True)
+        return JSONResponse({"success": False, "error": "Failed to write right image file"}, status_code=500)
 
     record = {
         "index": capture_count,
@@ -196,12 +206,14 @@ async def api_capture():
         "joint_names": list(joint_provider.joint_names),
         "q_rad": q_arr.tolist(),
         "image": f"left/{idx_str}.jpg",
+        "image_right": f"right/{idx_str}.jpg",
     }
     try:
         with open(joints_file, "w") as f:
             json.dump(record, f, indent=2, ensure_ascii=False)
     except OSError as exc:
-        img_file.unlink(missing_ok=True)
+        left_file.unlink(missing_ok=True)
+        right_file.unlink(missing_ok=True)
         return JSONResponse({"success": False, "error": f"Failed to write joints: {exc}"}, status_code=500)
 
     capture_count += 1
@@ -226,6 +238,14 @@ async def api_history():
 @app.get("/api/images/left/{filename}")
 async def api_get_image(filename: str):
     file_path = save_path / "left" / filename
+    if not file_path.exists():
+        return JSONResponse({"error": "Not found"}, status_code=404)
+    return FileResponse(file_path, media_type="image/jpeg")
+
+
+@app.get("/api/images/right/{filename}")
+async def api_get_image_right(filename: str):
+    file_path = save_path / "right" / filename
     if not file_path.exists():
         return JSONResponse({"error": "Not found"}, status_code=404)
     return FileResponse(file_path, media_type="image/jpeg")

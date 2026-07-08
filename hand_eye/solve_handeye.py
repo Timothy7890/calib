@@ -8,10 +8,14 @@ on the moving right hand (target on gripper). This is the classic *eye-to-hand*
 case. We recover ``T_cam2base`` (camera frame -> robot base frame), which is the
 real-world replacement for the nominal URDF camera mount.
 
-Pipeline (per captured sample)
-------------------------------
-1. Detect chessboard corners in the LEFT image.
-2. ``solvePnP`` with the calibrated LEFT intrinsics -> ``T_target2cam`` (board in
+Both eyes of the stereo pair are solved independently (``--eye both`` by default),
+each with its own intrinsics, yielding ``T_camL2base`` and ``T_camR2base``. A
+stereo cross-check reports the recovered right->left baseline as a sanity metric.
+
+Pipeline (per captured sample, per eye)
+---------------------------------------
+1. Detect chessboard corners in the eye's image (left/ or right/).
+2. ``solvePnP`` with that eye's calibrated intrinsics -> ``T_target2cam`` (board in
    camera frame).
 3. Forward kinematics from the recorded joint vector -> ``T_gripper2base`` (hand
    tip in base frame).
@@ -97,15 +101,16 @@ def geodesic_deg(Ra: np.ndarray, Rb: np.ndarray) -> float:
 # --------------- calibration data loading ---------------
 
 
-def load_left_intrinsics(yaml_path: Path) -> Tuple[np.ndarray, np.ndarray]:
+def load_intrinsics(yaml_path: Path, eye: str) -> Tuple[np.ndarray, np.ndarray]:
+    """Read {eye}_camera_matrix / {eye}_dist_coeffs from a stereo yaml (eye = left|right)."""
     fs = cv2.FileStorage(str(yaml_path), cv2.FILE_STORAGE_READ)
     if not fs.isOpened():
         raise SystemExit(f"Cannot open intrinsics yaml: {yaml_path}")
-    K = fs.getNode("left_camera_matrix").mat()
-    dist = fs.getNode("left_dist_coeffs").mat()
+    K = fs.getNode(f"{eye}_camera_matrix").mat()
+    dist = fs.getNode(f"{eye}_dist_coeffs").mat()
     fs.release()
     if K is None or dist is None:
-        raise SystemExit(f"{yaml_path} missing left_camera_matrix / left_dist_coeffs")
+        raise SystemExit(f"{yaml_path} missing {eye}_camera_matrix / {eye}_dist_coeffs")
     return K.astype(np.float64), dist.astype(np.float64)
 
 
@@ -151,49 +156,27 @@ def reorder_q(q: np.ndarray, stored_names: List[str], model_names: List[str]) ->
 # --------------- main ---------------
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Eye-to-hand calibration solver")
-    parser.add_argument("--data", required=True, help="Capture session dir (has left/ and joints/)")
-    parser.add_argument("--intrinsics", required=True, help="stereo_calibration.yaml (uses left_camera_matrix)")
-    parser.add_argument("--urdf", required=True, help="Robot URDF path")
-    parser.add_argument("--base-link", default="torso_link", help="FK base frame (output is cam->this frame)")
-    parser.add_argument("--tip-link", default="right_dex1_tool_link", help="Link the board is mounted near")
-    parser.add_argument("--board-size", default="11x8", help="Chessboard inner corners, e.g. 11x8")
-    parser.add_argument("--square-size", type=float, required=True, help="Square side length in mm")
-    parser.add_argument("--method", default="park",
-                        choices=["tsai", "park", "horaud", "andreff", "daniilidis"],
-                        help="cv2.calibrateHandEye method")
-    parser.add_argument("--no-reject", action="store_true",
-                        help="Disable robust outlier rejection (keep all samples)")
-    parser.add_argument("--max-trans-res-mm", type=float, default=8.0,
-                        help="Inlier threshold on board-to-hand translation residual (mm)")
-    parser.add_argument("--max-rot-res-deg", type=float, default=2.5,
-                        help="Inlier threshold on board-to-hand rotation residual (deg)")
-    parser.add_argument("--reject-iters", type=int, default=5,
-                        help="Max robust re-solve iterations")
-    args = parser.parse_args()
-
-    board_size = parse_board_size(args.board_size)
-    data_dir = Path(args.data)
-    left_dir = data_dir / "left"
+def solve_eye(
+    eye: str,
+    data_dir: Path,
+    K: np.ndarray,
+    dist: np.ndarray,
+    objp: np.ndarray,
+    board_size: Tuple[int, int],
+    model,
+    method_map: dict,
+    args: argparse.Namespace,
+) -> Optional[dict]:
+    """Run the full eye-to-hand pipeline for one eye. Returns the result dict, or None if skipped."""
+    img_dir = data_dir / eye
     joints_dir = data_dir / "joints"
-    if not left_dir.exists() or not joints_dir.exists():
-        raise SystemExit(f"{data_dir} must contain left/ and joints/")
+    if not img_dir.exists():
+        print(f"\n[{eye}] SKIP: image dir {img_dir} does not exist.")
+        return None
 
-    K, dist = load_left_intrinsics(Path(args.intrinsics))
-    objp = object_points_m(board_size, args.square_size)
-
-    from urdf_robot_model import URDFRobotModel
-    model = URDFRobotModel(args.urdf, args.base_link, args.tip_link)
-    print(f"[fk] base={args.base_link} tip={args.tip_link} joints={model.joint_names}")
-
-    method_map = {
-        "tsai": cv2.CALIB_HAND_EYE_TSAI,
-        "park": cv2.CALIB_HAND_EYE_PARK,
-        "horaud": cv2.CALIB_HAND_EYE_HORAUD,
-        "andreff": cv2.CALIB_HAND_EYE_ANDREFF,
-        "daniilidis": cv2.CALIB_HAND_EYE_DANIILIDIS,
-    }
+    print("\n" + "#" * 56)
+    print(f"# EYE = {eye}   ({img_dir})")
+    print("#" * 56)
 
     R_base2gripper: List[np.ndarray] = []
     t_base2gripper: List[np.ndarray] = []
@@ -202,10 +185,10 @@ def main() -> int:
     T_g2b_used: List[np.ndarray] = []
     T_t2c_used: List[np.ndarray] = []
 
-    left_files = sorted(left_dir.glob("*.jpg"))
-    print(f"Found {len(left_files)} images\n")
+    img_files = sorted(img_dir.glob("*.jpg"))
+    print(f"Found {len(img_files)} images\n")
 
-    for lf in left_files:
+    for lf in img_files:
         stem = lf.stem
         jf = joints_dir / f"{stem}.json"
         if not jf.exists():
@@ -251,9 +234,10 @@ def main() -> int:
         print(f"  [{stem}] OK  pnp_t(m)=[{t_t2c[0]:+.3f} {t_t2c[1]:+.3f} {t_t2c[2]:+.3f}]")
 
     n = len(R_target2cam)
-    print(f"\nUsable samples: {n}")
+    print(f"\n[{eye}] Usable samples: {n}")
     if n < 3:
-        raise SystemExit("Need at least 3 usable samples (recommended >= 8 with diverse arm poses).")
+        print(f"[{eye}] Need at least 3 usable samples (recommended >= 8 with diverse arm poses). SKIP.")
+        return None
 
     def solve_subset(idx):
         Rc2b, tc2b = cv2.calibrateHandEye(
@@ -284,12 +268,12 @@ def main() -> int:
             keep = [i for i in range(n)
                     if tr_mm[i] <= args.max_trans_res_mm and rot_deg[i] <= args.max_rot_res_deg]
             if len(keep) < 6:
-                print(f"[reject] iter {it}: only {len(keep)} inliers left — thresholds too tight, stopping.")
+                print(f"[{eye}][reject] iter {it}: only {len(keep)} inliers left — thresholds too tight, stopping.")
                 break
             if keep == inliers:
-                print(f"[reject] iter {it}: converged, {len(keep)}/{n} inliers.")
+                print(f"[{eye}][reject] iter {it}: converged, {len(keep)}/{n} inliers.")
                 break
-            print(f"[reject] iter {it}: {len(keep)}/{n} inliers "
+            print(f"[{eye}][reject] iter {it}: {len(keep)}/{n} inliers "
                   f"(dropped {n - len(keep)} outliers).")
             inliers = keep
             T_cam2base = solve_subset(inliers)
@@ -306,22 +290,23 @@ def main() -> int:
     t = t_cam2base.reshape(3)
 
     print("\n" + "=" * 56)
-    print(f"T_cam2base  (camera -> {args.base_link})   method={args.method}")
+    print(f"[{eye}] T_cam2base  (camera -> {args.base_link})   method={args.method}")
     print("-" * 56)
     print(f"  xyz (m)  = [{t[0]:+.5f}, {t[1]:+.5f}, {t[2]:+.5f}]")
     print(f"  rpy (rad)= [{rpy[0]:+.5f}, {rpy[1]:+.5f}, {rpy[2]:+.5f}]")
     print(f"  rpy (deg)= [{math.degrees(rpy[0]):+.2f}, {math.degrees(rpy[1]):+.2f}, {math.degrees(rpy[2]):+.2f}]")
     print(f"  R =\n{np.array2string(R_cam2base, precision=5, suppress_small=True)}")
     print("-" * 56)
-    print(f"Inliers used: {len(inliers)}/{n}")
+    print(f"[{eye}] Inliers used: {len(inliers)}/{n}")
     print("Consistency over inliers (board pose relative to hand should be constant):")
     print(f"  translation residual: mean={trans_res_mm.mean():.2f}mm  max={trans_res_mm.max():.2f}mm")
     print(f"  rotation residual:    mean={rot_res_deg.mean():.3f}deg max={rot_res_deg.max():.3f}deg")
     print("=" * 56)
     if trans_res_mm.mean() > 5.0 or rot_res_deg.mean() > 1.0:
-        print("[WARN] residuals still high -> add more / more-diverse arm poses, or check joint/image sync.")
+        print(f"[{eye}][WARN] residuals still high -> add more / more-diverse arm poses, or check joint/image sync.")
 
     result = {
+        "eye": eye,
         "base_link": args.base_link,
         "tip_link": args.tip_link,
         "method": args.method,
@@ -338,9 +323,90 @@ def main() -> int:
         "residual_translation_mm": {"mean": float(trans_res_mm.mean()), "max": float(trans_res_mm.max())},
         "residual_rotation_deg": {"mean": float(rot_res_deg.mean()), "max": float(rot_res_deg.max())},
     }
-    out_path = data_dir / "handeye_result.json"
+    out_path = data_dir / f"handeye_result_{eye}.json"
     out_path.write_text(json.dumps(result, indent=2, ensure_ascii=False))
-    print(f"\n[OK] saved -> {out_path}")
+    print(f"[{eye}] saved -> {out_path}")
+    return result
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description="Eye-to-hand calibration solver (left + right)")
+    parser.add_argument("--data", required=True, help="Capture session dir (has left/ right/ and joints/)")
+    parser.add_argument("--intrinsics", required=True,
+                        help="stereo_calibration.yaml (uses {eye}_camera_matrix / {eye}_dist_coeffs)")
+    parser.add_argument("--urdf", required=True, help="Robot URDF path")
+    parser.add_argument("--eye", default="both", choices=["left", "right", "both"],
+                        help="Which eye(s) to solve (default: both)")
+    parser.add_argument("--base-link", default="torso_link", help="FK base frame (output is cam->this frame)")
+    parser.add_argument("--tip-link", default="right_dex1_tool_link", help="Link the board is mounted near")
+    parser.add_argument("--board-size", default="11x8", help="Chessboard inner corners, e.g. 11x8")
+    parser.add_argument("--square-size", type=float, required=True, help="Square side length in mm")
+    parser.add_argument("--method", default="park",
+                        choices=["tsai", "park", "horaud", "andreff", "daniilidis"],
+                        help="cv2.calibrateHandEye method")
+    parser.add_argument("--no-reject", action="store_true",
+                        help="Disable robust outlier rejection (keep all samples)")
+    parser.add_argument("--max-trans-res-mm", type=float, default=8.0,
+                        help="Inlier threshold on board-to-hand translation residual (mm)")
+    parser.add_argument("--max-rot-res-deg", type=float, default=2.5,
+                        help="Inlier threshold on board-to-hand rotation residual (deg)")
+    parser.add_argument("--reject-iters", type=int, default=5,
+                        help="Max robust re-solve iterations")
+    args = parser.parse_args()
+
+    board_size = parse_board_size(args.board_size)
+    data_dir = Path(args.data)
+    joints_dir = data_dir / "joints"
+    if not joints_dir.exists():
+        raise SystemExit(f"{data_dir} must contain joints/")
+
+    objp = object_points_m(board_size, args.square_size)
+
+    from urdf_robot_model import URDFRobotModel
+    model = URDFRobotModel(args.urdf, args.base_link, args.tip_link)
+    print(f"[fk] base={args.base_link} tip={args.tip_link} joints={model.joint_names}")
+
+    method_map = {
+        "tsai": cv2.CALIB_HAND_EYE_TSAI,
+        "park": cv2.CALIB_HAND_EYE_PARK,
+        "horaud": cv2.CALIB_HAND_EYE_HORAUD,
+        "andreff": cv2.CALIB_HAND_EYE_ANDREFF,
+        "daniilidis": cv2.CALIB_HAND_EYE_DANIILIDIS,
+    }
+
+    eyes = ["left", "right"] if args.eye == "both" else [args.eye]
+    results: dict = {}
+    for eye in eyes:
+        K, dist = load_intrinsics(Path(args.intrinsics), eye)
+        res = solve_eye(eye, data_dir, K, dist, objp, board_size, model, method_map, args)
+        if res is not None:
+            results[eye] = res
+
+    if not results:
+        raise SystemExit("No eye produced a usable result.")
+
+    # Stereo cross-check: the two cameras are rigidly linked, so
+    # T_right2left = inv(T_camL2base) @ T_camR2base should equal the fixed stereo baseline.
+    if "left" in results and "right" in results:
+        T_l = np.array(results["left"]["T_cam2base"])
+        T_r = np.array(results["right"]["T_cam2base"])
+        T_r2l = invert_T(T_l) @ T_r
+        baseline_mm = float(np.linalg.norm(T_r2l[:3, 3]) * 1000.0)
+        print("\n" + "=" * 56)
+        print("Stereo cross-check (right camera relative to left camera):")
+        print(f"  baseline |t| = {baseline_mm:.2f} mm")
+        print(f"  t (m)        = {np.array2string(T_r2l[:3, 3], precision=5, suppress_small=True)}")
+        print("  (should match the known left<->right stereo baseline)")
+        print("=" * 56)
+        combined_path = data_dir / "handeye_result.json"
+        combined_path.write_text(json.dumps({
+            "left": results["left"],
+            "right": results["right"],
+            "T_right2left": T_r2l.tolist(),
+            "stereo_baseline_mm": baseline_mm,
+        }, indent=2, ensure_ascii=False))
+        print(f"[OK] combined saved -> {combined_path}")
+
     return 0
 
 
