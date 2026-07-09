@@ -216,6 +216,20 @@ def main():
 
         status = ""
         if count_ok:
+            # findChessboardCornersSB can order corners starting from either end
+            # of a symmetric board, so the same physical corner may land at index
+            # 0 in one camera and index N-1 in the other. That breaks the L<->R
+            # point correspondence stereoCalibrate relies on (huge stereo RMS
+            # even when each mono calibration is fine). With a small baseline the
+            # board projects to nearly the same place in both images, so align
+            # right ordering to left by reversing it when that matches better.
+            lcf = l_corners.reshape(-1, 2)
+            rcf = r_corners.reshape(-1, 2)
+            d_same = np.mean(np.linalg.norm(lcf - rcf, axis=1))
+            d_rev = np.mean(np.linalg.norm(lcf - rcf[::-1], axis=1))
+            if d_rev < d_same:
+                r_corners = r_corners[::-1].copy()
+
             obj_points.append(objp)
             left_img_points.append(l_corners)
             right_img_points.append(r_corners)
