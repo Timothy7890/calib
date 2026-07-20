@@ -45,6 +45,12 @@ def main() -> int:
                         help="h2 模式用哪条手臂（默认 right）")
     parser.add_argument("--base-link", default=None,
                         help="h2 模式的基座 link（默认取 h2.yaml 的 torso_link）")
+
+    parser.add_argument("--arm-control", action="store_true",
+                        help="启用手臂点动/卸力控制（发布 rt/arm_sdk，真机会动！"
+                             "确保没有其他程序在控制手臂）")
+    parser.add_argument("--arm-max-speed", type=float, default=0.2,
+                        help="点动最大关节速度 rad/s（默认 0.2）")
     args = parser.parse_args()
 
     from backend import app as app_module
@@ -60,16 +66,32 @@ def main() -> int:
     camera.start()
     print(f"[handeye3d] camera info: {camera.info()}")
 
+    arm_controller = None
+    if args.arm_control:
+        from backend.arm import H2ArmController
+
+        print("[handeye3d] !!! 手臂控制已启用：将发布 rt/arm_sdk，真机会动。")
+        print("[handeye3d] !!! 请确认没有其他程序（遥操作等）在控制手臂。")
+        arm_controller = H2ArmController(
+            arm=args.arm, network_interface=args.network_interface,
+            max_speed_rad_s=args.arm_max_speed,
+        )
+        arm_controller.start()
+        print(f"[handeye3d] arm_control = on ({args.arm}, "
+              f"max_speed={args.arm_max_speed} rad/s)，已在当前姿态保持")
+
     pose_provider = make_pose_provider(
         args.pose_source, http_url=args.pose_url,
         network_interface=args.network_interface,
         arm=args.arm, base_link=args.base_link,
+        q_reader=arm_controller.read_measured if arm_controller else None,
     )
     print(f"[handeye3d] pose_source = {pose_provider.source} (auto={pose_provider.available}, "
           f"base={pose_provider.base_link}, wrist={pose_provider.wrist_link})")
 
     app_module.camera = camera
     app_module.pose_provider = pose_provider
+    app_module.arm_controller = arm_controller
     app_module.save_path = session_dir
     app_module.init_state()
 
@@ -80,6 +102,9 @@ def main() -> int:
     try:
         uvicorn.run(app_module.app, host=args.host, port=args.port)
     finally:
+        if arm_controller is not None:
+            print("[handeye3d] 手臂权重渐出、交还本体控制器（请扶住手臂）...")
+            arm_controller.shutdown()
         camera.stop()
     return 0
 

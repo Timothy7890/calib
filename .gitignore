@@ -20,3 +20,5 @@ pnpm-debug.log*
 *.swp
 .DS_Store
 Thumbs.db
+
+hand_eye_3D/handeye3d_data/*

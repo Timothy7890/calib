@@ -97,3 +97,14 @@ tr:hover td { background: var(--panel-hover); }
 }
 .badge.good { color: var(--ok); border-color: var(--ok); }
 .badge.bad { color: var(--err); border-color: var(--err); }
+
+/* 手臂点动 */
+.btn.warn { border-color: var(--warn); color: var(--warn); }
+.btn.warn:hover { background: var(--warn); color: #000; }
+.step-group { display: flex; gap: 4px; flex-wrap: wrap; }
+.step-btn { padding: 4px 10px; font-size: 12px; }
+.step-btn.active { background: var(--accent); border-color: var(--accent); color: #fff; }
+.jog-table td { text-align: left; }
+.jog-name { color: var(--text-dim); }
+.jog-val { text-align: right !important; min-width: 60px; }
+.jog-btn { padding: 3px 14px; font-size: 15px; font-weight: 600; margin-left: 4px; }

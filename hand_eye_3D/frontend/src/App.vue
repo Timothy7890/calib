@@ -154,9 +154,57 @@ function wristSummary(T) {
   return `[${T[0][3].toFixed(3)}, ${T[1][3].toFixed(3)}, ${T[2][3].toFixed(3)}]`
 }
 
+// ---- 手臂点动（--arm-control 时后端才有） ----
+
+const arm = ref(null)             // /api/arm/status 的返回
+const armBusy = ref(false)
+const stepDeg = ref(2)            // 步长（度）
+const stepOptions = [0.5, 1, 2, 5, 10]
+
+async function refreshArm() {
+  try {
+    arm.value = await (await fetch('/api/arm/status')).json()
+  } catch { /* 后端未起或断连，下轮再试 */ }
+}
+
+async function armPost(path, body) {
+  armBusy.value = true
+  errorMsg.value = ''
+  try {
+    const res = await fetch(`/api/arm/${path}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: body ? JSON.stringify(body) : undefined,
+    })
+    const data = await res.json()
+    if (!data.ok) errorMsg.value = data.error || `${path} 失败`
+    else arm.value = { enabled: true, ...data }
+  } catch (e) {
+    errorMsg.value = String(e)
+  } finally {
+    armBusy.value = false
+  }
+}
+
+function nudgeJoint(index, sign) {
+  const delta = sign * stepDeg.value * Math.PI / 180
+  armPost('nudge', { index, delta })
+}
+
+function handMove() {
+  if (!confirm('卸力后手臂会因重力下坠，请先扶住手臂！确认进入卸力模式？')) return
+  armPost('hand_move')
+}
+
+function jointShortName(name) {
+  return name.replace(/^(left|right)_/, '').replace(/_joint$/, '')
+}
+
 onMounted(async () => {
   await refreshStatus()
   await refreshSamples()
+  await refreshArm()
+  setInterval(refreshArm, 800)
 })
 </script>
 
@@ -199,6 +247,55 @@ onMounted(async () => {
 
     <!-- 右：操作区 -->
     <div class="side-panel">
+      <!-- 手臂点动（--arm-control 时显示） -->
+      <div v-if="arm?.enabled" class="card">
+        <h2>
+          0. {{ arm.arm === 'right' ? '右' : '左' }}臂点动
+          <span class="badge" :class="arm.float ? 'bad' : (arm.jog_enabled ? 'good' : '')">
+            {{ arm.float ? '卸力中（扶住！）' : (arm.jog_enabled ? '点动开启' : '刚性保持') }}
+          </span>
+        </h2>
+        <div class="field-row">
+          <label>模式</label>
+          <button v-if="!arm.jog_enabled && !arm.float" class="btn primary"
+                  :disabled="armBusy" @click="armPost('enable_jog')">开启点动</button>
+          <button v-if="arm.jog_enabled" class="btn"
+                  :disabled="armBusy" @click="armPost('disable_jog')">停止点动</button>
+          <button v-if="!arm.jog_enabled && !arm.float" class="btn warn"
+                  :disabled="armBusy" @click="handMove">卸力拖动</button>
+          <button v-if="arm.float" class="btn primary"
+                  :disabled="armBusy" @click="armPost('stop')">保持当前位置</button>
+        </div>
+        <div class="field-row">
+          <label>步长</label>
+          <span class="step-group">
+            <button v-for="s in stepOptions" :key="s" class="btn step-btn"
+                    :class="{ active: stepDeg === s }" @click="stepDeg = s">{{ s }}°</button>
+          </span>
+        </div>
+        <table class="jog-table">
+          <tbody>
+            <tr v-for="(name, i) in arm.joint_names" :key="name">
+              <td class="jog-name">{{ jointShortName(name) }}</td>
+              <td class="jog-val">
+                {{ arm.measured_rad ? (arm.measured_rad[i] * 180 / Math.PI).toFixed(1) : '?' }}°
+              </td>
+              <td>
+                <button class="btn jog-btn" :disabled="!arm.jog_enabled || armBusy"
+                        @click="nudgeJoint(i, -1)">−</button>
+                <button class="btn jog-btn" :disabled="!arm.jog_enabled || armBusy"
+                        @click="nudgeJoint(i, +1)">+</button>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+        <div class="video-hint">
+          点动有限速（{{ arm.max_speed_rad_s }} rad/s）并钳制在关节限位内。
+          卸力模式下 kp=0 只留阻尼，手臂会下坠，务必有人扶住；
+          摆好位置后点「保持当前位置」即锁定。
+        </div>
+      </div>
+
       <!-- 当前样本 -->
       <div class="card">
         <h2>1. 当前样本</h2>

@@ -32,6 +32,7 @@ from .solver import (
 
 camera: CameraBase = MockCamera()
 pose_provider: PoseProvider = ManualPoseProvider()
+arm_controller = None  # run_server 传 --arm-control 时注入 H2ArmController
 save_path: Path = Path("./handeye3d_data")
 
 app = FastAPI(title="Hand-Eye 3D (point + wrist-pose) Calibration")
@@ -125,6 +126,81 @@ async def api_wrist_pose():
                 "source": pose_provider.source}
     except Exception as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=503)
+
+
+# --------------- 手臂点动（可选，--arm-control 时启用） ---------------
+
+
+def _arm_absent():
+    return JSONResponse(
+        {"ok": False, "error": "未启用手臂控制，启动时加 --arm-control"}, status_code=409)
+
+
+@app.get("/api/arm/status")
+async def api_arm_status():
+    if arm_controller is None:
+        return {"enabled": False}
+    st = arm_controller.status()
+    st["enabled"] = True
+    return st
+
+
+@app.post("/api/arm/enable_jog")
+async def api_arm_enable_jog():
+    if arm_controller is None:
+        return _arm_absent()
+    arm_controller.enable_jog()
+    return {"ok": True, **arm_controller.status()}
+
+
+@app.post("/api/arm/disable_jog")
+async def api_arm_disable_jog():
+    if arm_controller is None:
+        return _arm_absent()
+    arm_controller.disable_jog()
+    return {"ok": True, **arm_controller.status()}
+
+
+@app.post("/api/arm/stop")
+async def api_arm_stop():
+    """冻结在当前指令位并刚性保持（也用于退出卸力）。"""
+    if arm_controller is None:
+        return _arm_absent()
+    arm_controller.stop()
+    return {"ok": True, **arm_controller.status()}
+
+
+@app.post("/api/arm/hand_move")
+async def api_arm_hand_move():
+    """卸力拖动模式：kp=0 只留阻尼，手臂会下坠，必须有人扶住！"""
+    if arm_controller is None:
+        return _arm_absent()
+    ok = arm_controller.enter_hand_move()
+    if not ok:
+        return JSONResponse(
+            {"ok": False, "error": "点动开启时不能进入卸力模式，请先停止点动"}, status_code=409)
+    return {"ok": True, **arm_controller.status()}
+
+
+@app.post("/api/arm/nudge")
+async def api_arm_nudge(body: dict):
+    """单关节步进。Body: {"index": int, "delta": float}（弧度）。"""
+    if arm_controller is None:
+        return _arm_absent()
+    try:
+        index = int(body["index"])
+        delta = float(body["delta"])
+    except (KeyError, TypeError, ValueError):
+        return JSONResponse({"ok": False, "error": "需要 index(int) 和 delta(float)"},
+                            status_code=400)
+    try:
+        accepted = arm_controller.nudge(index, delta)
+    except (IndexError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    if not accepted:
+        return JSONResponse({"ok": False, "error": "点动未开启（或处于卸力模式）"},
+                            status_code=409)
+    return {"ok": True, **arm_controller.status()}
 
 
 # --------------- 样本管理 ---------------

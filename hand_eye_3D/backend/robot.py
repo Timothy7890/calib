@@ -110,12 +110,13 @@ class H2PoseProvider(PoseProvider):
 
     def __init__(self, network_interface: str | None = None,
                  arm: str = "right", base_link: str | None = None,
-                 lowstate_timeout: float = 5.0):
-        from unitree_sdk2py.core.channel import (
-            ChannelFactoryInitialize,
-            ChannelSubscriber,
-        )
+                 lowstate_timeout: float = 5.0, q_reader=None):
+        """q_reader: 可选的无参函数，返回该手臂 7 关节角。
+        提供时（如共用 H2ArmController 的订阅）不再自建 DDS 订阅。"""
+        from unitree_sdk2py.core.channel import ChannelSubscriber
         from unitree_sdk2py.idl.unitree_hg.msg.dds_ import LowState_
+
+        from .dds import ensure_dds_initialized
 
         if str(IK_REPLAY_ROOT) not in sys.path:
             sys.path.insert(0, str(IK_REPLAY_ROOT))
@@ -133,28 +134,29 @@ class H2PoseProvider(PoseProvider):
         self.base_link = base_link or self._model.base_link(self._chain)
         self.wrist_link = self._model.end_link(self._chain)
 
-        # DDS 初始化 + 订阅（只读，不创建任何 publisher）
-        if network_interface:
-            ChannelFactoryInitialize(0, network_interface)
-        else:
-            ChannelFactoryInitialize(0)
+        self._q_reader = q_reader
         self._lock = threading.Lock()
         self._low_state = None
-        self._subscriber = ChannelSubscriber("rt/lowstate", LowState_)
-        self._subscriber.Init(self._on_low_state, 10)
+        if q_reader is None:
+            # DDS 初始化 + 订阅（只读，不创建任何 publisher）
+            ensure_dds_initialized(network_interface)
+            self._subscriber = ChannelSubscriber("rt/lowstate", LowState_)
+            self._subscriber.Init(self._on_low_state, 10)
 
-        deadline = time.monotonic() + lowstate_timeout
-        while self._low_state is None:
-            if time.monotonic() >= deadline:
-                raise TimeoutError(
-                    f"{lowstate_timeout:.0f}s 内没收到 rt/lowstate（网卡对吗？机器人开机了吗？）")
-            time.sleep(0.05)
+            deadline = time.monotonic() + lowstate_timeout
+            while self._low_state is None:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"{lowstate_timeout:.0f}s 内没收到 rt/lowstate（网卡对吗？机器人开机了吗？）")
+                time.sleep(0.05)
 
     def _on_low_state(self, msg) -> None:
         with self._lock:
             self._low_state = msg
 
     def read_arm_q(self) -> np.ndarray:
+        if self._q_reader is not None:
+            return np.asarray(self._q_reader(), dtype=float).reshape(-1)
         with self._lock:
             state = self._low_state
         if state is None:
@@ -177,7 +179,8 @@ class H2PoseProvider(PoseProvider):
 def make_pose_provider(source: str, *, http_url: str | None = None,
                        network_interface: str | None = None,
                        arm: str = "right",
-                       base_link: str | None = None) -> PoseProvider:
+                       base_link: str | None = None,
+                       q_reader=None) -> PoseProvider:
     if source == "manual":
         return ManualPoseProvider()
     if source == "mock":
@@ -188,5 +191,5 @@ def make_pose_provider(source: str, *, http_url: str | None = None,
         return HttpPoseProvider(http_url)
     if source == "h2":
         return H2PoseProvider(network_interface=network_interface,
-                              arm=arm, base_link=base_link)
+                              arm=arm, base_link=base_link, q_reader=q_reader)
     raise ValueError(f"未知 pose source: {source!r}（可选 manual/http/h2/mock）")

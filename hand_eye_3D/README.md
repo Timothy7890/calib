@@ -54,6 +54,10 @@ unifolm-wma 环境跑本服务 / 在 unifolm-wma 里跑一个 pose sidecar 走
 python run_server.py --camera-source orbbec --camera-serial CP0BB53000FS \
     --pose-source h2 --network-interface eth0
 
+# H2 真机 + 网页点动/卸力（发布 rt/arm_sdk，真机会动！确保没有其他控制程序）
+python run_server.py --camera-source orbbec --camera-serial CP0BB53000FS \
+    --pose-source h2 --network-interface eth0 --arm-control
+
 # 手腕位姿手填（任何机器人可用）
 python run_server.py --camera-source orbbec
 
@@ -64,8 +68,22 @@ python run_server.py --camera-source mock --pose-source mock
 cd frontend && npm run dev     # http://<IP>:7012
 ```
 
-> H2 模式**只订阅** `rt/lowstate`，绝不发布 `rt/arm_sdk`/`rt/lowcmd`，
+> 默认 H2 模式**只订阅** `rt/lowstate`，绝不发布 `rt/arm_sdk`/`rt/lowcmd`，
 > 与现有控制程序并存不会引起抢占/抽搐。摆位姿用你现有的控制方式。
+
+### --arm-control 手臂点动（可选）
+
+加 `--arm-control` 后，网页顶部多出「点动」卡片，等价于老 hand_eye 的摆位姿方式：
+
+- **开启点动**：7 个关节各有 ±按钮，步长 0.5°/1°/2°/5°/10° 可选；
+  目标以限速（`--arm-max-speed`，默认 0.2 rad/s）平滑逼近，且钳制在 URDF 限位内。
+- **卸力拖动**：被控手臂 kp=0 只留小阻尼，人手直接拖到目标位姿；
+  **手臂会因重力下坠，进入前必须扶住**。摆好后点「保持当前位置」即刚性锁定。
+- 另一条手臂全程保持在启动瞬间的实测姿态；启动/退出时权重 1s 渐入/渐出，无跳变。
+
+**安全须知**：该模式会发布 `rt/arm_sdk`。宇树机器人不允许两个程序同时控制身体，
+启用前务必停掉遥操作等一切在控制手臂的程序，否则会抽搐。退出服务前请扶住手臂
+（权重渐出后手臂交还本体控制器）。
 
 ## 操作流程
 
