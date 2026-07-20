@@ -170,6 +170,9 @@ onMounted(async () => {
     <span v-if="status" class="badge">
       相机: {{ status.camera.name || status.camera.source }} {{ status.camera.serial }}
     </span>
+    <span v-if="status?.camera?.width" class="badge">
+      分辨率: {{ status.camera.width }}×{{ status.camera.height }}
+    </span>
     <span v-if="status" class="badge">
       位姿源: {{ status.pose_source }} ({{ status.wrist_link }})
     </span>

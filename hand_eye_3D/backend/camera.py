@@ -141,9 +141,16 @@ class OrbbecRGBDCamera(CameraBase):
 
     @staticmethod
     def _pick_best_color_profile(ob, profiles):
-        """遍历所有 RGB 档位，选像素数最大的（同分辨率取 30fps 以内最高帧率）。"""
+        """遍历所有可解码的彩色档位，按 (像素数, 格式优先级, 帧率) 选最优。
+
+        高分辨率彩色通常只有 MJPG 压缩格式（裸 RGB 受 USB 带宽限制），
+        所以 RGB/MJPG/YUYV/NV12 都接受，_loop 里按格式解码。
+        """
+        fmt_pref = {ob.OBFormat.RGB: 3, ob.OBFormat.MJPG: 2,
+                    ob.OBFormat.NV12: 1, ob.OBFormat.YUYV: 1}
         best = None
-        best_key = (-1, -1)
+        best_key = (-1, -1, -1)
+        available = []
         try:
             for i in range(profiles.get_count()):
                 p = profiles.get_stream_profile_by_index(i)
@@ -151,19 +158,24 @@ class OrbbecRGBDCamera(CameraBase):
                     vp = p.as_video_stream_profile()
                 except Exception:
                     continue
-                if vp.get_format() != ob.OBFormat.RGB:
-                    continue
+                fmt = vp.get_format()
                 fps = vp.get_fps()
-                if fps > 30:
+                available.append(f"{vp.get_width()}x{vp.get_height()}@{fps} {fmt}")
+                if fmt not in fmt_pref or fps > 30:
                     continue
-                key = (vp.get_width() * vp.get_height(), fps)
+                key = (vp.get_width() * vp.get_height(), fmt_pref[fmt], fps)
                 if key > best_key:
                     best_key = key
                     best = vp
-        except Exception:
+        except Exception as e:
+            print(f"[camera] 枚举彩色档位失败: {e}")
             best = None
+        print(f"[camera] 可用彩色档位: {available}")
         if best is not None:
+            print(f"[camera] 选用: {best.get_width()}x{best.get_height()}"
+                  f"@{best.get_fps()} {best.get_format()}")
             return best
+        print("[camera] 未找到可解码彩色档位，回退默认档")
         try:
             return profiles.get_video_stream_profile(0, 0, ob.OBFormat.RGB, 0)
         except Exception:
@@ -193,9 +205,9 @@ class OrbbecRGBDCamera(CameraBase):
                 if color is None or depth is None:
                     continue
 
-                w, h = color.get_width(), color.get_height()
-                rgb = np.frombuffer(color.get_data(), np.uint8).reshape(h, w, 3)
-                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                bgr = self._decode_color(color)
+                if bgr is None:
+                    continue
 
                 dw, dh = depth.get_width(), depth.get_height()
                 scale = depth.get_depth_scale()
@@ -209,6 +221,22 @@ class OrbbecRGBDCamera(CameraBase):
             except Exception as e:
                 self.error = str(e)
                 time.sleep(0.2)
+
+    def _decode_color(self, color) -> np.ndarray | None:
+        """按格式把彩色帧解码成 BGR。"""
+        ob = self._ob
+        fmt = color.get_format()
+        w, h = color.get_width(), color.get_height()
+        data = np.frombuffer(color.get_data(), np.uint8)
+        if fmt == ob.OBFormat.RGB:
+            return cv2.cvtColor(data.reshape(h, w, 3), cv2.COLOR_RGB2BGR)
+        if fmt == ob.OBFormat.MJPG:
+            return cv2.imdecode(data, cv2.IMREAD_COLOR)
+        if fmt == ob.OBFormat.YUYV:
+            return cv2.cvtColor(data.reshape(h, w, 2), cv2.COLOR_YUV2BGR_YUYV)
+        if fmt == ob.OBFormat.NV12:
+            return cv2.cvtColor(data.reshape(h * 3 // 2, w), cv2.COLOR_YUV2BGR_NV12)
+        return None
 
     # ---- 数据接口 ----
 
