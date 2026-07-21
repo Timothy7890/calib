@@ -68,6 +68,7 @@ class H2ArmController:
         self.joint_names, self.limits = _load_joint_limits(arm)
         self.n = len(self.joint_names)
         self.max_speed = float(max_speed_rad_s)
+        self._speed_ceiling = self.max_speed   # 启动参数是天花板，段级只能往下调
         self.hand_move_kd = float(hand_move_kd)
         self.kp = float(kp)
         self.kd = float(kd)
@@ -103,6 +104,7 @@ class H2ArmController:
         q0 = self._clamp(self._read_motors(self._jog_indices))
         self._cmd_q = q0.copy()
         self._desired_q = q0.copy()
+        self._tau_ff = np.zeros(self.n)   # 前馈力矩（按压/拨动出力用）
         self._other_hold_q = self._read_motors(self._other_indices)
         self._thread = threading.Thread(target=self._loop, name="h2-arm-jog", daemon=True)
 
@@ -140,12 +142,13 @@ class H2ArmController:
         q = np.asarray(q, dtype=float).reshape(-1)
         return np.minimum(np.maximum(q, self.limits[:, 0]), self.limits[:, 1])
 
-    def _write_command(self, jog_q: np.ndarray, float_mode: bool, weight: float) -> None:
+    def _write_command(self, jog_q: np.ndarray, float_mode: bool, weight: float,
+                       tau_ff: np.ndarray) -> None:
         cmd = self._low_cmd
         cmd.motor_cmd[WEIGHT_MOTOR_INDEX].q = float(weight)
-        for value, idx in zip(jog_q, self._jog_indices):
+        for value, tau, idx in zip(jog_q, tau_ff, self._jog_indices):
             m = cmd.motor_cmd[idx]
-            m.tau = 0.0
+            m.tau = 0.0 if float_mode else float(tau)
             m.q = float(value)
             m.dq = 0.0
             if float_mode:
@@ -176,12 +179,18 @@ class H2ArmController:
                     self._weight = min(1.0, self._weight + CONTROL_DT / WEIGHT_RAMP_S)
                 weight = self._weight
                 if not float_mode:
+                    # 矢量同步限速：按最饱和的关节整体等比减速，方向不变，
+                    # 所有关节同时到达 → 关节空间直线不会被扭成"先平移后抬升"
                     step = self.max_speed * CONTROL_DT
-                    delta = np.clip(self._desired_q - self._cmd_q, -step, step)
+                    delta = self._desired_q - self._cmd_q
+                    worst = float(np.max(np.abs(delta)))
+                    if worst > step:
+                        delta = delta * (step / worst)
                     self._cmd_q = self._cmd_q + delta
                 cmd_q = self._cmd_q.copy()
+                tau_ff = self._tau_ff.copy()
             try:
-                self._write_command(cmd_q, float_mode, weight)
+                self._write_command(cmd_q, float_mode, weight, tau_ff)
             except Exception:
                 pass
             if stopping and weight <= 0.0:
@@ -217,11 +226,13 @@ class H2ArmController:
             self._float = False
             self._desired_q = self._cmd_q.copy()
             self._jog_enabled = True
+            self._tau_ff[:] = 0.0
 
     def disable_jog(self) -> None:
         with self._lock:
             self._desired_q = self._cmd_q.copy()
             self._jog_enabled = False
+            self._tau_ff[:] = 0.0
 
     def stop(self) -> None:
         """冻结 + 刚性保持（也用于退出卸力模式）。"""
@@ -232,6 +243,30 @@ class H2ArmController:
             self._float = False
             self._desired_q = self._cmd_q.copy()
             self._jog_enabled = False
+            self._tau_ff[:] = 0.0
+
+    def set_max_speed(self, v: float) -> None:
+        """段级速度档：普通段慢而稳，快拨段提速；不会超过启动参数的天花板。"""
+        with self._lock:
+            self.max_speed = float(np.clip(v, 0.05, self._speed_ceiling))
+
+    def set_tau_ff(self, tau) -> bool:
+        """设置前馈力矩（Nm/关节，任一关节超 ±20 时整体等比缩小，保持力方向）。
+        位置指令照常，出力叠加在其上；点动关闭、卸力、急停都会自动清零。
+        用于贴着表面按压/拨动时主动出力。"""
+        with self._lock:
+            if not self._jog_enabled:
+                return False
+            tau = np.asarray(tau, dtype=float).reshape(-1)
+            if tau.size != self.n:
+                raise ValueError(f"需要 {self.n} 个关节力矩，收到 {tau.size}")
+            if not np.all(np.isfinite(tau)):
+                raise ValueError("力矩包含非法值")
+            worst = float(np.max(np.abs(tau)))
+            if worst > 20.0:
+                tau = tau * (20.0 / worst)
+            self._tau_ff = tau
+            return True
 
     def set_target(self, q_desired) -> bool:
         with self._lock:

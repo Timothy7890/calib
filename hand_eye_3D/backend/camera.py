@@ -30,6 +30,10 @@ class CameraBase:
     def pick(self, u: int, v: int, win: int = 5) -> dict:
         raise NotImplementedError
 
+    def depth_snapshot(self) -> tuple[np.ndarray, tuple[float, float, float, float]] | None:
+        """返回 (多帧中值深度图 mm, 彩色内参 fx/fy/cx/cy)，无数据时 None。"""
+        return None
+
     def info(self) -> dict:
         return {"source": self.source}
 
@@ -60,6 +64,12 @@ class MockCamera(CameraBase):
             "p_camera": [(u - self.width / 2) * z / fx, (v - self.height / 2) * z / fy, z],
             "depth_mm": 1000.0, "valid_ratio": 1.0, "pixel": [u, v],
         }
+
+    def depth_snapshot(self):
+        # 合成场景：0.9m 处一面墙，中间凸出一个 0.6m 的方块，联调障碍扫描用
+        depth = np.full((self.height, self.width), 900.0, np.float32)
+        depth[200:500, 500:800] = 600.0
+        return depth, (900.0, 900.0, self.width / 2, self.height / 2)
 
     def info(self) -> dict:
         return {"source": self.source, "width": self.width, "height": self.height,
@@ -135,9 +145,35 @@ class OrbbecRGBDCamera(CameraBase):
         self.intrinsics = (intr.fx, intr.fy, intr.cx, intr.cy)
 
         self._align = ob.AlignFilter(align_to_stream=ob.OBStreamType.COLOR_STREAM)
+        self._config = config
         self._pipeline.start(config)
         self._thread = threading.Thread(target=self._loop, daemon=True)
         self._thread.start()
+
+        # 看门狗：pipeline 偶尔会"启动成功但永远不出帧"（上个进程没释放干净），
+        # 白屏难排查，这里等首帧，超时先重启管道一次，再不行直接报错退出。
+        if not self._wait_first_frame(6.0):
+            print("[camera] 启动后 6s 没有帧，重启 pipeline 重试…")
+            try:
+                self._pipeline.stop()
+            except Exception:
+                pass
+            time.sleep(1.0)
+            self._pipeline.start(config)
+            if not self._wait_first_frame(6.0):
+                self._stop_evt.set()
+                raise RuntimeError(
+                    "相机 pipeline 不出帧。通常是设备被别的进程占用或处于坏状态，"
+                    "请关掉其他用相机的程序；仍不行可用 SDK reboot 相机或重插 USB。")
+
+    def _wait_first_frame(self, timeout: float) -> bool:
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            with self._lock:
+                if self._color_bgr is not None and self._depth_hist:
+                    return True
+            time.sleep(0.2)
+        return False
 
     @staticmethod
     def _pick_best_color_profile(ob, profiles):
@@ -285,6 +321,16 @@ class OrbbecRGBDCamera(CameraBase):
             "valid_ratio": float(valid.size / total),
             "pixel": [u, v],
         }
+
+    def depth_snapshot(self):
+        if self.intrinsics is None:
+            return None
+        with self._lock:
+            hist = list(self._depth_hist)
+        if not hist:
+            return None
+        depth = np.median(np.stack(hist), axis=0).astype(np.float32)
+        return depth, self.intrinsics
 
     def info(self) -> dict:
         fx, fy, cx, cy = self.intrinsics or (0, 0, 0, 0)
