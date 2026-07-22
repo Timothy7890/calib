@@ -7,6 +7,9 @@
           已拍摄: <strong>{{ captureCount }}</strong> 组
         </span>
         <span class="status-item">
+          分辨率: <strong>{{ resolution || '获取中...' }}</strong><template v-if="resolution"> / 眼</template>
+        </span>
+        <span class="status-item">
           棋盘格:
           <input
             v-model="boardSizeInput"
@@ -136,6 +139,7 @@ const showCorners = ref(true)
 const boardSizeInput = ref('11x8')
 const historyImages = ref([])
 const savePath = ref('')
+const resolution = ref('')
 const allowNoCorners = ref(false)
 const capturing = ref(false)
 
@@ -231,6 +235,7 @@ function connectWebSocket() {
     leftDetected.value = data.left_detected
     rightDetected.value = data.right_detected
     captureCount.value = data.count
+    if (data.resolution) resolution.value = data.resolution
   }
 
   ws.onclose = () => {
@@ -296,6 +301,7 @@ async function loadStatus() {
     if (data.board_size) boardSizeInput.value = data.board_size
     if (data.count !== undefined) captureCount.value = data.count
     if (data.save_path) savePath.value = data.save_path
+    if (data.resolution) resolution.value = data.resolution
   } catch (e) {
     console.error('Failed to load status:', e)
   }

@@ -26,6 +26,7 @@ camera: Optional[CameraManager] = None
 save_path: Path = Path("./calib_images")
 board_size: Tuple[int, int] = (9, 6)
 capture_count: int = 0
+resolution: str = ""  # per-eye resolution "WxH", updated from live frames
 
 
 def _count_existing_captures() -> int:
@@ -98,6 +99,7 @@ async def ws_stream(ws: WebSocket):
 
     recv_task = asyncio.create_task(receive_commands())
 
+    global resolution
     try:
         while True:
             pair = await asyncio.to_thread(camera.grab, 2.0)
@@ -106,6 +108,8 @@ async def ws_stream(ws: WebSocket):
                 continue
 
             left, right = pair
+            h, w = left.shape[:2]
+            resolution = f"{w}x{h}"
             left_detected, left_display = detect_corners(left, local_board_size, draw=show_corners)
             right_detected, right_display = detect_corners(right, local_board_size, draw=show_corners)
 
@@ -115,6 +119,7 @@ async def ws_stream(ws: WebSocket):
                 "left_detected": left_detected,
                 "right_detected": right_detected,
                 "count": capture_count,
+                "resolution": resolution,
             })
             await ws.send_text(payload)
             await asyncio.sleep(0.02)
@@ -127,15 +132,30 @@ async def ws_stream(ws: WebSocket):
 # --------------- REST API ---------------
 
 
+def _write_capture_meta(res_str: str):
+    """Persist capture session metadata (resolution etc.) next to the images."""
+    meta = {
+        "resolution": res_str,
+        "board_size": f"{board_size[0]}x{board_size[1]}",
+    }
+    try:
+        with open(save_path / "capture_info.json", "w") as f:
+            json.dump(meta, f, indent=2)
+    except OSError:
+        pass
+
+
 @app.post("/api/capture")
 async def api_capture():
     """Capture current frame and save to disk."""
-    global capture_count
+    global capture_count, resolution
     pair = await asyncio.to_thread(camera.grab, 3.0)
     if pair is None:
         return JSONResponse({"success": False, "error": "No frame available"}, status_code=503)
 
     left, right = pair
+    h, w = left.shape[:2]
+    resolution = f"{w}x{h}"
     idx_str = f"{capture_count:04d}"
     (save_path / "left").mkdir(parents=True, exist_ok=True)
     (save_path / "right").mkdir(parents=True, exist_ok=True)
@@ -144,7 +164,8 @@ async def api_capture():
     if not ok_l or not ok_r:
         return JSONResponse({"success": False, "error": "Failed to write image files"}, status_code=500)
     capture_count += 1
-    return {"success": True, "index": capture_count - 1, "count": capture_count}
+    _write_capture_meta(resolution)
+    return {"success": True, "index": capture_count - 1, "count": capture_count, "resolution": resolution}
 
 
 @app.get("/api/history")
@@ -188,6 +209,7 @@ async def api_status():
         "count": capture_count,
         "board_size": f"{board_size[0]}x{board_size[1]}",
         "save_path": str(save_path),
+        "resolution": resolution,
     }
 
 

@@ -115,6 +115,7 @@ def save_results(output_path: Path, left_calib: dict, right_calib: dict, stereo:
 
     # JSON output (human-readable)
     result_json = {
+        "resolution": f"{image_size[0]}x{image_size[1]}",  # per-eye, WxH
         "image_size": list(image_size),
         "board_size": list(board_size),
         "square_size_mm": square_size,
