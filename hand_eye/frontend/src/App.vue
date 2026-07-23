@@ -178,6 +178,76 @@
       </div>
     </div>
 
+    <div class="solve-panel">
+      <div class="tcp-header">
+        <h3>手眼求解 (一键)</h3>
+        <span class="tcp-count" v-if="solveRunning">求解中: {{ solveSession }}...</span>
+      </div>
+      <p class="tcp-note">
+        选择采集目录和双目内参(robot-twoeyes 标定产物),一键运行 solve_handeye.py。
+        FK 链: {{ solveBaseLink }} → {{ solveTipLink }} · URDF: {{ solveUrdf || '未配置' }}
+      </p>
+      <div class="solve-controls">
+        <label>采集目录:
+          <select v-model="solveSessionSel" class="tcp-select solve-select">
+            <option v-for="s in solveSessions" :key="s.name" :value="s.name">
+              {{ s.name }}{{ s.is_current ? ' (当前)' : '' }} · {{ s.n_images }}图/{{ s.n_joints }}关节{{ s.has_result ? ' · 已有结果' : '' }}
+            </option>
+          </select>
+        </label>
+        <button class="mini-btn" @click="loadSolveLists">刷新</button>
+      </div>
+      <div class="solve-controls">
+        <label>双目内参:
+          <select v-model="solveIntrinsicsSel" class="tcp-select solve-select">
+            <option v-for="it in solveIntrinsicsList" :key="it.path" :value="it.path">
+              {{ it.label }}
+            </option>
+            <option value="__custom__">自定义路径...</option>
+          </select>
+        </label>
+        <input
+          v-if="solveIntrinsicsSel === '__custom__'"
+          v-model="solveIntrinsicsCustom" class="solve-input wide"
+          placeholder="/path/to/stereo_calibration.yaml"
+        />
+      </div>
+      <div class="solve-controls">
+        <label>方格边长(mm):
+          <input type="number" step="0.5" min="1" v-model.number="solveSquareMm" class="solve-input" />
+        </label>
+        <label>棋盘格:
+          <input v-model="solveBoardSize" class="solve-input" placeholder="11x8" />
+        </label>
+        <label>方法:
+          <select v-model="solveMethod" class="tcp-select">
+            <option value="park">park</option>
+            <option value="tsai">tsai</option>
+            <option value="horaud">horaud</option>
+            <option value="andreff">andreff</option>
+            <option value="daniilidis">daniilidis</option>
+          </select>
+        </label>
+        <button class="tcp-btn solve-btn" :disabled="solveRunning || !solveSessionSel" @click="startSolve">
+          {{ solveRunning ? '求解中...' : '一键求解' }}
+        </button>
+      </div>
+      <div v-if="solveError" class="solve-error">{{ solveError }}</div>
+      <div v-if="solveSummary.length > 0" class="solve-result">
+        <div v-for="r in solveSummary" :key="r.eye" class="solve-result-eye">
+          <strong>[{{ r.eye }}]</strong> T_cam2base:
+          xyz(m) = [{{ r.xyz.map((v) => v.toFixed(4)).join(', ') }}] ·
+          rpy(deg) = [{{ r.rpyDeg.map((v) => v.toFixed(2)).join(', ') }}] ·
+          残差 平移 {{ r.transMm.toFixed(2) }}mm / 旋转 {{ r.rotDeg.toFixed(3) }}° ·
+          内点 {{ r.inliers }}/{{ r.samples }}
+        </div>
+        <div v-if="solveBaselineMm !== null" class="solve-result-eye">
+          <strong>双目交叉校验</strong> 基线 |t| = {{ solveBaselineMm.toFixed(2) }} mm(应接近已知双目基线)
+        </div>
+      </div>
+      <pre v-if="solveLog.length > 0" class="solve-log" ref="solveLogEl">{{ solveLog.join('\n') }}</pre>
+    </div>
+
     <div class="history" v-if="historyImages.length > 0">
       <h3>采集历史 ({{ historyImages.length }})</h3>
       <div class="history-grid">
@@ -231,6 +301,25 @@ const tcpGroup = ref('tip')
 const tcpItems = ref([])
 const tcpGroups = ref({})
 const tcpCapturing = ref(false)
+
+// --- one-click hand-eye solve state ---
+const solveSessions = ref([])
+const solveSessionSel = ref('')
+const solveIntrinsicsList = ref([])
+const solveIntrinsicsSel = ref('')
+const solveIntrinsicsCustom = ref('')
+const solveSquareMm = ref(10)
+const solveBoardSize = ref('11x8')
+const solveMethod = ref('park')
+const solveRunning = ref(false)
+const solveSession = ref('')
+const solveLog = ref([])
+const solveError = ref('')
+const solveResult = ref(null)
+const solveUrdf = ref('')
+const solveBaseLink = ref('')
+const solveTipLink = ref('')
+const solveLogEl = ref(null)
 
 const R2D = 180 / Math.PI
 const D2R = Math.PI / 180
@@ -332,7 +421,10 @@ async function loadStatus() {
   try {
     const res = await fetch('/api/status')
     const data = await res.json()
-    if (data.board_size) boardSizeInput.value = data.board_size
+    if (data.board_size) {
+      boardSizeInput.value = data.board_size
+      solveBoardSize.value = data.board_size
+    }
     if (data.count !== undefined) captureCount.value = data.count
     if (data.save_path) savePath.value = data.save_path
     if (data.camera_source) cameraSource.value = data.camera_source
@@ -506,6 +598,109 @@ async function deleteTcp(index) {
   }
 }
 
+// --- one-click hand-eye solve ---
+
+const R2D_ = 180 / Math.PI
+const solveSummary = computed(() => {
+  const res = solveResult.value
+  if (!res) return []
+  const out = []
+  for (const eye of ['left', 'right']) {
+    const r = res[eye]
+    if (!r || !r.t_cam2base_m) continue
+    out.push({
+      eye,
+      xyz: r.t_cam2base_m,
+      rpyDeg: (r.rpy_rad || []).map((v) => v * R2D_),
+      transMm: r.residual_translation_mm ? r.residual_translation_mm.mean : NaN,
+      rotDeg: r.residual_rotation_deg ? r.residual_rotation_deg.mean : NaN,
+      inliers: r.num_inliers,
+      samples: r.num_samples,
+    })
+  }
+  return out
+})
+const solveBaselineMm = computed(() => {
+  const res = solveResult.value
+  return res && typeof res.stereo_baseline_mm === 'number' ? res.stereo_baseline_mm : null
+})
+
+async function loadSolveLists() {
+  try {
+    const [sr, ir] = await Promise.all([
+      fetch('/api/solve/sessions').then((r) => r.json()),
+      fetch('/api/solve/intrinsics').then((r) => r.json()),
+    ])
+    solveSessions.value = sr.sessions || []
+    if (!solveSessionSel.value && solveSessions.value.length > 0) {
+      const cur = solveSessions.value.find((s) => s.is_current)
+      solveSessionSel.value = (cur || solveSessions.value[0]).name
+    }
+    solveIntrinsicsList.value = ir.items || []
+    if (!solveIntrinsicsSel.value && solveIntrinsicsList.value.length > 0) {
+      solveIntrinsicsSel.value = solveIntrinsicsList.value[0].path
+    }
+  } catch (e) {
+    console.error('solve lists failed', e)
+  }
+}
+
+let solveTimer = null
+async function pollSolve() {
+  try {
+    const res = await fetch('/api/solve/status')
+    const data = await res.json()
+    solveRunning.value = data.running
+    solveSession.value = data.session || ''
+    solveLog.value = data.log || []
+    solveError.value = data.error || ''
+    solveResult.value = data.result
+    solveUrdf.value = data.urdf || ''
+    solveBaseLink.value = data.base_link || ''
+    solveTipLink.value = data.tip_link || ''
+    if (solveLogEl.value) solveLogEl.value.scrollTop = solveLogEl.value.scrollHeight
+    if (!data.running && solveTimer) {
+      clearInterval(solveTimer)
+      solveTimer = null
+      loadSolveLists()
+    }
+  } catch (e) {
+    console.error('solve status failed', e)
+  }
+}
+
+async function startSolve() {
+  const intrinsics =
+    solveIntrinsicsSel.value === '__custom__' ? solveIntrinsicsCustom.value.trim() : solveIntrinsicsSel.value
+  if (!intrinsics) {
+    alert('请选择双目内参文件')
+    return
+  }
+  try {
+    const res = await fetch('/api/solve', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        session: solveSessionSel.value,
+        intrinsics,
+        square_size_mm: solveSquareMm.value,
+        board_size: solveBoardSize.value,
+        method: solveMethod.value,
+      }),
+    })
+    const data = await res.json()
+    if (!data.success) {
+      alert('启动求解失败: ' + (data.error || res.status))
+      return
+    }
+    solveRunning.value = true
+    if (!solveTimer) solveTimer = setInterval(pollSolve, 1000)
+    pollSolve()
+  } catch (e) {
+    alert('请求失败: ' + e.message)
+  }
+}
+
 function onKeydown(e) {
   if (e.code !== 'Space') return
   const t = e.target
@@ -523,6 +718,10 @@ onMounted(() => {
   pollArm(true)
   armTimer = setInterval(pollArm, 400)
   loadTcp()
+  loadSolveLists()
+  pollSolve().then(() => {
+    if (solveRunning.value && !solveTimer) solveTimer = setInterval(pollSolve, 1000)
+  })
   window.addEventListener('keydown', onKeydown)
 })
 
@@ -530,6 +729,7 @@ onUnmounted(() => {
   if (ws) ws.close()
   if (jointsTimer) clearInterval(jointsTimer)
   if (armTimer) clearInterval(armTimer)
+  if (solveTimer) clearInterval(solveTimer)
   window.removeEventListener('keydown', onKeydown)
 })
 </script>
@@ -849,6 +1049,88 @@ onUnmounted(() => {
   padding: 16px 20px;
   border: 1px solid #2a2a4a;
   margin-bottom: 24px;
+}
+.solve-panel {
+  background: #16213e;
+  border-radius: 12px;
+  padding: 16px 20px;
+  border: 1px solid #2a2a4a;
+  margin-bottom: 24px;
+}
+.solve-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  margin-bottom: 10px;
+  font-size: 0.9rem;
+  color: #bbb;
+}
+.solve-select {
+  max-width: 420px;
+}
+.solve-input {
+  width: 90px;
+  padding: 6px 10px;
+  border: 1px solid #555;
+  border-radius: 6px;
+  background: #2a2a4a;
+  color: #eee;
+  margin-left: 6px;
+}
+.solve-input.wide {
+  width: 420px;
+}
+.mini-btn {
+  padding: 6px 14px;
+  border: 1px solid #3a6ea5;
+  border-radius: 6px;
+  background: transparent;
+  color: #7db3e8;
+  cursor: pointer;
+}
+.solve-btn {
+  background: linear-gradient(135deg, #7b4fd6, #b96ce8);
+}
+.solve-error {
+  margin: 10px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(229, 57, 53, 0.15);
+  border: 1px solid #e53935;
+  color: #ff8a80;
+  font-size: 0.85rem;
+  white-space: pre-wrap;
+}
+.solve-result {
+  margin: 10px 0;
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: rgba(0, 179, 119, 0.1);
+  border: 1px solid #00b377;
+  font-size: 0.85rem;
+  color: #c8f7e4;
+}
+.solve-result-eye {
+  margin: 4px 0;
+  font-family: 'Consolas', 'Monaco', monospace;
+}
+.solve-result-eye strong {
+  color: #00e5a0;
+}
+.solve-log {
+  margin: 10px 0 0;
+  max-height: 260px;
+  overflow-y: auto;
+  background: #0d1220;
+  border: 1px solid #2a2a4a;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 0.75rem;
+  line-height: 1.45;
+  color: #9aa4c0;
+  white-space: pre-wrap;
+  word-break: break-all;
 }
 .tcp-header {
   display: flex;

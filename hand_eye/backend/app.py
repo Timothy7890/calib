@@ -13,6 +13,10 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+import re
+import subprocess
+import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +41,10 @@ board_size: Tuple[int, int] = (11, 8)
 capture_count: int = 0
 # Optional right-arm jog controller (set by run_server when --arm-control is on).
 arm_controller = None
+# Solver defaults (injected by run_server).
+urdf_path: str = ""
+base_link: str = "torso_link"
+tip_link: str = "right_dex1_tool_link"
 
 
 def _count_existing_captures() -> int:
@@ -443,6 +451,203 @@ async def api_arm_set(body: dict):
     if not ok:
         return JSONResponse({"success": False, "error": "jog not enabled"}, status_code=409)
     return {"success": True}
+
+
+# --------------- One-click hand-eye solve (runs solve_handeye.py) ---------------
+
+_HANDEYE_ROOT = Path(__file__).resolve().parents[1]
+_CALIB_ROOT = _HANDEYE_ROOT.parent
+_TS_DIR_RE = re.compile(r"^\d{8}_\d{6}$")
+
+solve_job: dict = {"running": False, "session": "", "log": [], "result": None, "error": ""}
+_solve_lock = threading.Lock()
+
+
+def _sessions_base() -> Path:
+    """Base dir that holds capture session folders.
+
+    run_server normally saves into <base>/<YYYYmmdd_HHMMSS>; with
+    --no-timestamp-dir, save_path itself is the base.
+    """
+    if _TS_DIR_RE.match(save_path.name):
+        return save_path.parent
+    return save_path
+
+
+@app.get("/api/solve/sessions")
+async def api_solve_sessions():
+    base = _sessions_base()
+    sessions = []
+    if base.exists():
+        for d in sorted(base.iterdir(), reverse=True):
+            if not d.is_dir() or not (d / "joints").is_dir():
+                continue
+            n_images = len(list((d / "left").glob("*.jpg"))) if (d / "left").is_dir() else 0
+            n_joints = len(list((d / "joints").glob("*.json")))
+            has_result = (d / "handeye_result.json").exists() or (
+                d / "handeye_result_left.json").exists()
+            board = ""
+            meta_f = d / "session_meta.json"
+            if meta_f.exists():
+                try:
+                    board = json.loads(meta_f.read_text()).get("board_size", "")
+                except (OSError, json.JSONDecodeError):
+                    pass
+            sessions.append({
+                "name": d.name,
+                "n_images": n_images,
+                "n_joints": n_joints,
+                "board_size": board,
+                "has_result": has_result,
+                "is_current": d.resolve() == save_path.resolve(),
+            })
+    return {"base": str(base), "sessions": sessions}
+
+
+@app.get("/api/solve/intrinsics")
+async def api_solve_intrinsics():
+    """List stereo_calibration.yaml files produced by the robot-twoeyes tool."""
+    items = []
+    calib_images = _CALIB_ROOT / "robot-twoeyes" / "data" / "calib_images"
+    if calib_images.exists():
+        for d in sorted(calib_images.iterdir(), reverse=True):
+            f = d / "stereo_calibration.yaml"
+            if d.is_dir() and f.exists():
+                items.append({"label": d.name, "path": str(f)})
+    return {"items": items}
+
+
+def _load_solve_result(data_dir: Path) -> Optional[dict]:
+    combined = data_dir / "handeye_result.json"
+    if combined.exists():
+        try:
+            return json.loads(combined.read_text())
+        except (OSError, json.JSONDecodeError):
+            return None
+    out: dict = {}
+    for eye in ("left", "right"):
+        f = data_dir / f"handeye_result_{eye}.json"
+        if f.exists():
+            try:
+                out[eye] = json.loads(f.read_text())
+            except (OSError, json.JSONDecodeError):
+                pass
+    return out or None
+
+
+def _run_solve_job(cmd: list, data_dir: Path) -> None:
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(_HANDEYE_ROOT),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            with _solve_lock:
+                solve_job["log"].append(line.rstrip("\n"))
+                if len(solve_job["log"]) > 800:
+                    del solve_job["log"][:200]
+        rc = proc.wait()
+        result = _load_solve_result(data_dir)
+        with _solve_lock:
+            if rc != 0 and result is None:
+                solve_job["error"] = f"solve_handeye.py exited with code {rc}"
+            solve_job["result"] = result
+    except Exception as exc:
+        with _solve_lock:
+            solve_job["error"] = str(exc)
+    finally:
+        with _solve_lock:
+            solve_job["running"] = False
+
+
+@app.post("/api/solve")
+async def api_solve(body: dict):
+    """Start a background hand-eye solve. Body:
+    {"session": str, "intrinsics": str, "square_size_mm": float,
+     "board_size": str?, "method": str?, "eye": str?}
+    """
+    with _solve_lock:
+        if solve_job["running"]:
+            return JSONResponse(
+                {"success": False, "error": f"已有求解在运行: {solve_job['session']}"},
+                status_code=409,
+            )
+
+    session = str(body.get("session", "")).strip()
+    data_dir = (_sessions_base() / session).resolve()
+    if not session or _sessions_base().resolve() not in data_dir.parents:
+        return JSONResponse({"success": False, "error": "无效的 session"}, status_code=400)
+    if not (data_dir / "joints").is_dir():
+        return JSONResponse({"success": False, "error": f"{data_dir} 缺少 joints/"}, status_code=400)
+
+    intrinsics = str(body.get("intrinsics", "")).strip()
+    if not intrinsics or not Path(intrinsics).exists():
+        return JSONResponse({"success": False, "error": f"内参文件不存在: {intrinsics}"}, status_code=400)
+
+    try:
+        square = float(body.get("square_size_mm"))
+        if not (0.1 < square < 1000):
+            raise ValueError
+    except (TypeError, ValueError):
+        return JSONResponse({"success": False, "error": "square_size_mm 无效"}, status_code=400)
+
+    bs = str(body.get("board_size") or f"{board_size[0]}x{board_size[1]}")
+    method = str(body.get("method") or "park")
+    if method not in ("tsai", "park", "horaud", "andreff", "daniilidis"):
+        return JSONResponse({"success": False, "error": f"未知 method: {method}"}, status_code=400)
+    eye = str(body.get("eye") or "both")
+    if eye not in ("left", "right", "both"):
+        return JSONResponse({"success": False, "error": f"未知 eye: {eye}"}, status_code=400)
+
+    if not urdf_path or not Path(urdf_path).exists():
+        return JSONResponse(
+            {"success": False, "error": f"服务器 URDF 不存在: {urdf_path}(用 --urdf 指定)"},
+            status_code=500,
+        )
+
+    cmd = [
+        sys.executable, "-u", str(_HANDEYE_ROOT / "solve_handeye.py"),
+        "--data", str(data_dir),
+        "--intrinsics", intrinsics,
+        "--urdf", urdf_path,
+        "--board-size", bs,
+        "--square-size", str(square),
+        "--base-link", base_link,
+        "--tip-link", tip_link,
+        "--method", method,
+        "--eye", eye,
+    ]
+
+    with _solve_lock:
+        solve_job.update({
+            "running": True,
+            "session": session,
+            "log": ["$ " + " ".join(cmd)],
+            "result": None,
+            "error": "",
+        })
+    threading.Thread(target=_run_solve_job, args=(cmd, data_dir), daemon=True).start()
+    return {"success": True, "session": session}
+
+
+@app.get("/api/solve/status")
+async def api_solve_status():
+    with _solve_lock:
+        return {
+            "running": solve_job["running"],
+            "session": solve_job["session"],
+            "log": list(solve_job["log"]),
+            "result": solve_job["result"],
+            "error": solve_job["error"],
+            "urdf": urdf_path,
+            "base_link": base_link,
+            "tip_link": tip_link,
+        }
 
 
 @app.post("/api/arm/nudge")
