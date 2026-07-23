@@ -224,6 +224,16 @@ watch(autoCapture, (on) => {
   if (!on) stopAuto()
 })
 
+function onKeydown(e) {
+  if (e.code !== 'Space') return
+  // 输入框聚焦时不拦截空格
+  const tag = (e.target && e.target.tagName) || ''
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return
+  e.preventDefault() // 防止页面滚动/触发聚焦按钮的默认点击
+  if (captureBtnDisabled.value) return
+  onCaptureBtn()
+}
+
 function connectWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
   ws = new WebSocket(`${protocol}//${location.host}${API_PREFIX}/ws/stream`)
@@ -311,11 +321,13 @@ onMounted(() => {
   loadStatus()
   connectWebSocket()
   loadHistory()
+  window.addEventListener('keydown', onKeydown)
 })
 
 onUnmounted(() => {
   stopAuto()
   if (ws) ws.close()
+  window.removeEventListener('keydown', onKeydown)
 })
 </script>
 
