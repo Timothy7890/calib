@@ -109,7 +109,7 @@ def stereo_calibrate(
     }
 
 
-def save_results(output_path: Path, left_calib: dict, right_calib: dict, stereo: dict, image_size, board_size, square_size):
+def save_results(output_path: Path, left_calib: dict, right_calib: dict, stereo: dict, image_size, board_size, square_size, log=print):
     """Save calibration results to JSON and OpenCV YAML."""
     output_path.mkdir(parents=True, exist_ok=True)
 
@@ -141,7 +141,7 @@ def save_results(output_path: Path, left_calib: dict, right_calib: dict, stereo:
     json_path = output_path / "calibration_result.json"
     with open(json_path, "w") as f:
         json.dump(result_json, f, indent=2)
-    print(f"[OK] JSON results saved to: {json_path}")
+    log(f"[OK] JSON results saved to: {json_path}")
 
     # OpenCV FileStorage YAML (for C++/Python direct loading)
     yaml_path = output_path / "stereo_calibration.yaml"
@@ -157,50 +157,40 @@ def save_results(output_path: Path, left_calib: dict, right_calib: dict, stereo:
     fs.write("E", stereo["E"])
     fs.write("F", stereo["F"])
     fs.release()
-    print(f"[OK] OpenCV YAML saved to: {yaml_path}")
+    log(f"[OK] OpenCV YAML saved to: {yaml_path}")
 
 
-def main():
-    parser = argparse.ArgumentParser(description="Stereo Camera Calibration")
-    parser.add_argument("--data_path", required=True, help="Path to calibration data (contains left/ and right/)")
-    parser.add_argument("--board_size", default="11x8", help="Inner corners, e.g. 11x8")
-    parser.add_argument("--square_size", type=float, default=15.0, help="Square side length in mm")
-    args = parser.parse_args()
+def run_calibration(data_path, board_size: Tuple[int, int], square_size: float, log=print) -> dict:
+    """Run the full stereo calibration pipeline on a captured session directory.
 
-    data_path = Path(args.data_path)
+    Args:
+        data_path: session dir containing left/ and right/ subdirs
+        board_size: chessboard inner corners (cols, rows)
+        square_size: square side length in mm
+        log: callable receiving progress strings
+
+    Returns:
+        Summary dict (JSON-serializable). Raises ValueError on bad input.
+    """
+    data_path = Path(data_path)
     left_dir = data_path / "left"
     right_dir = data_path / "right"
-
     if not left_dir.exists() or not right_dir.exists():
-        print(f"[ERROR] left/ or right/ directory not found in {data_path}")
-        sys.exit(1)
+        raise ValueError(f"left/ or right/ directory not found in {data_path}")
 
-    cols, rows = args.board_size.split("x")
-    board_size = (int(cols), int(rows))
-    square_size = args.square_size
-
-    print(f"Board size: {board_size[0]}x{board_size[1]} inner corners")
-    print(f"Square size: {square_size} mm")
-    print(f"Data path: {data_path}")
-    print()
-
-    # Collect image pairs
     left_files = sorted(left_dir.glob("*.jpg"))
     right_files = sorted(right_dir.glob("*.jpg"))
-
     if len(left_files) != len(right_files):
-        print(f"[WARNING] Left ({len(left_files)}) and right ({len(right_files)}) image counts differ!")
-    
-    pairs = list(zip(left_files, right_files))
-    print(f"Found {len(pairs)} image pairs")
-    print()
+        log(f"[WARNING] Left ({len(left_files)}) and right ({len(right_files)}) image counts differ!")
 
-    # Detect corners
+    pairs = list(zip(left_files, right_files))
+    log(f"Board size: {board_size[0]}x{board_size[1]}, square size: {square_size} mm")
+    log(f"Found {len(pairs)} image pairs in {data_path}")
+
     objp = get_object_points(board_size, square_size)
     obj_points = []
     left_img_points = []
     right_img_points = []
-    used_pairs = []
     image_size = None
 
     for i, (lf, rf) in enumerate(pairs):
@@ -215,15 +205,8 @@ def main():
             and r_corners.shape[0] == expected
         )
 
-        status = ""
         if count_ok:
-            # findChessboardCornersSB can order corners starting from either end
-            # of a symmetric board, so the same physical corner may land at index
-            # 0 in one camera and index N-1 in the other. That breaks the L<->R
-            # point correspondence stereoCalibrate relies on (huge stereo RMS
-            # even when each mono calibration is fine). With a small baseline the
-            # board projects to nearly the same place in both images, so align
-            # right ordering to left by reversing it when that matches better.
+            # Align right corner ordering to left (symmetric boards may flip).
             lcf = l_corners.reshape(-1, 2)
             rcf = r_corners.reshape(-1, 2)
             d_same = np.mean(np.linalg.norm(lcf - rcf, axis=1))
@@ -234,7 +217,6 @@ def main():
             obj_points.append(objp)
             left_img_points.append(l_corners)
             right_img_points.append(r_corners)
-            used_pairs.append((lf, rf))
             status = "OK"
             if image_size is None:
                 img = cv2.imread(str(lf))
@@ -252,52 +234,60 @@ def main():
                 parts.append("right FAIL")
             status = ", ".join(parts)
 
-        print(f"  [{i:03d}] {lf.name} / {rf.name} → {status}")
+        log(f"[{i:03d}] {lf.name} → {status}")
 
-    print()
-    print(f"Valid pairs: {len(obj_points)} / {len(pairs)}")
-
+    log(f"Valid pairs: {len(obj_points)} / {len(pairs)}")
     if len(obj_points) < 3:
-        print("[ERROR] Not enough valid pairs for calibration (need at least 3)")
-        sys.exit(1)
+        raise ValueError(f"Not enough valid pairs for calibration: {len(obj_points)} (need at least 3)")
 
-    print(f"Image size: {image_size[0]}x{image_size[1]}")
-    print()
+    log(f"Image size: {image_size[0]}x{image_size[1]}")
 
-    # Calibrate left
-    print("=" * 50)
-    print("Calibrating LEFT camera...")
+    log("Calibrating LEFT camera...")
     left_calib = calibrate_single(obj_points, left_img_points, image_size)
-    print(f"  RMS reprojection error: {left_calib['rms_error']:.4f} px")
-    print(f"  fx={left_calib['camera_matrix'][0,0]:.2f}, fy={left_calib['camera_matrix'][1,1]:.2f}")
-    print(f"  cx={left_calib['camera_matrix'][0,2]:.2f}, cy={left_calib['camera_matrix'][1,2]:.2f}")
-    print()
+    log(f"  LEFT RMS: {left_calib['rms_error']:.4f} px")
 
-    # Calibrate right
-    print("Calibrating RIGHT camera...")
+    log("Calibrating RIGHT camera...")
     right_calib = calibrate_single(obj_points, right_img_points, image_size)
-    print(f"  RMS reprojection error: {right_calib['rms_error']:.4f} px")
-    print(f"  fx={right_calib['camera_matrix'][0,0]:.2f}, fy={right_calib['camera_matrix'][1,1]:.2f}")
-    print(f"  cx={right_calib['camera_matrix'][0,2]:.2f}, cy={right_calib['camera_matrix'][1,2]:.2f}")
-    print()
+    log(f"  RIGHT RMS: {right_calib['rms_error']:.4f} px")
 
-    # Stereo calibration
-    print("Stereo calibration...")
+    log("Stereo calibration...")
     stereo = stereo_calibrate(
         obj_points, left_img_points, right_img_points,
         left_calib, right_calib, image_size,
     )
-    print(f"  RMS reprojection error: {stereo['rms_error']:.4f} px")
-    print(f"  Baseline (T): [{stereo['T'][0,0]:.2f}, {stereo['T'][1,0]:.2f}, {stereo['T'][2,0]:.2f}] mm")
-    baseline_mm = np.linalg.norm(stereo['T'])
-    print(f"  Baseline distance: {baseline_mm:.2f} mm")
-    print()
+    baseline_mm = float(np.linalg.norm(stereo["T"]))
+    log(f"  STEREO RMS: {stereo['rms_error']:.4f} px, baseline: {baseline_mm:.2f} mm")
 
-    # Save
-    print("=" * 50)
-    save_results(data_path, left_calib, right_calib, stereo, image_size, board_size, square_size)
-    print()
-    print("Calibration complete!")
+    save_results(data_path, left_calib, right_calib, stereo, image_size, board_size, square_size, log=log)
+    log("Calibration complete!")
+
+    return {
+        "valid_pairs": len(obj_points),
+        "total_pairs": len(pairs),
+        "resolution": f"{image_size[0]}x{image_size[1]}",
+        "image_size": list(image_size),
+        "left_rms": float(left_calib["rms_error"]),
+        "right_rms": float(right_calib["rms_error"]),
+        "stereo_rms": float(stereo["rms_error"]),
+        "baseline_mm": baseline_mm,
+        "yaml_path": str(data_path / "stereo_calibration.yaml"),
+        "json_path": str(data_path / "calibration_result.json"),
+    }
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Stereo Camera Calibration")
+    parser.add_argument("--data_path", required=True, help="Path to calibration data (contains left/ and right/)")
+    parser.add_argument("--board_size", default="11x8", help="Inner corners, e.g. 11x8")
+    parser.add_argument("--square_size", type=float, default=15.0, help="Square side length in mm")
+    args = parser.parse_args()
+
+    cols, rows = args.board_size.split("x")
+    try:
+        run_calibration(Path(args.data_path), (int(cols), int(rows)), args.square_size, log=print)
+    except ValueError as e:
+        print(f"[ERROR] {e}")
+        sys.exit(1)
 
 
 if __name__ == "__main__":
