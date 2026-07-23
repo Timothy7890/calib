@@ -136,6 +136,25 @@ async def ws_stream(ws: WebSocket):
 # --------------- REST API ---------------
 
 
+def _session_resolution() -> str:
+    """Resolution of images already in this session ('' if empty session)."""
+    meta_file = save_path / "capture_info.json"
+    if meta_file.exists():
+        try:
+            res = json.loads(meta_file.read_text()).get("resolution", "")
+            if res:
+                return res
+        except (OSError, json.JSONDecodeError):
+            pass
+    files = sorted((save_path / "left").glob("*.jpg"))
+    if files:
+        img = cv2.imread(str(files[0]))
+        if img is not None:
+            h, w = img.shape[:2]
+            return f"{w}x{h}"
+    return ""
+
+
 def _write_capture_meta(res_str: str):
     """Persist capture session metadata (resolution etc.) next to the images."""
     meta = {
@@ -160,6 +179,18 @@ async def api_capture():
     left, right = pair
     h, w = left.shape[:2]
     resolution = f"{w}x{h}"
+
+    # Reject captures whose resolution differs from images already in this
+    # session (e.g. teleimager was reconfigured after the session started).
+    session_res = _session_resolution()
+    if session_res and session_res != resolution:
+        return JSONResponse({
+            "success": False,
+            "error": (f"分辨率不一致：当前相机为 {resolution}，"
+                      f"本会话已有 {session_res} 的图像。"
+                      f"请重启采集服务开始新会话后再拍摄。"),
+        }, status_code=409)
+
     idx_str = f"{capture_count:04d}"
     (save_path / "left").mkdir(parents=True, exist_ok=True)
     (save_path / "right").mkdir(parents=True, exist_ok=True)

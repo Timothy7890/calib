@@ -32,6 +32,9 @@
           保存: <strong>{{ savePath }}</strong>
         </span>
       </div>
+      <div v-if="resolutionMismatch" class="res-mismatch">
+        ⚠ 当前相机分辨率 {{ resolution }} 与本会话目录 ({{ sessionDirResolution }}) 不一致，拍摄将被拒绝。请确认相机配置后重启采集服务。
+      </div>
     </header>
 
     <main class="main-content">
@@ -224,6 +227,16 @@ const prepSec = ref(10)
 const intervalSec = ref(3)
 const countdown = ref(0)
 const lastAutoMsg = ref('')
+
+// e.g. save path ".../20260723112330_1920x1200" → "1920x1200"
+const sessionDirResolution = computed(() => {
+  const m = (savePath.value || '').match(/_(\d+x\d+)\/?$/)
+  return m ? m[1] : ''
+})
+
+const resolutionMismatch = computed(() =>
+  Boolean(resolution.value && sessionDirResolution.value && resolution.value !== sessionDirResolution.value)
+)
 
 const canCapture = computed(() => {
   if (allowNoCorners.value) return true
@@ -756,6 +769,17 @@ onUnmounted(() => {
 
 .save-path {
   font-size: 0.8rem;
+}
+
+.res-mismatch {
+  margin-top: 10px;
+  padding: 8px 16px;
+  border-radius: 8px;
+  display: inline-block;
+  background: rgba(229, 57, 53, 0.15);
+  border: 1px solid rgba(229, 57, 53, 0.6);
+  color: #ff8a80;
+  font-size: 0.88rem;
 }
 
 /* History */
