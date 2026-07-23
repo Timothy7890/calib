@@ -395,6 +395,25 @@ async def api_arm_stop():
     return {"success": True}
 
 
+@app.post("/api/arm/release")
+async def api_arm_release():
+    """放弃接管: stop low-level streaming and give control back to the body
+    controller. The operator should support the arm before calling."""
+    if arm_controller is None:
+        return JSONResponse({"success": False, "error": "arm control disabled"}, status_code=409)
+    restored = await asyncio.to_thread(arm_controller.release_takeover)
+    return {"success": True, "restored_mode": restored}
+
+
+@app.post("/api/arm/engage")
+async def api_arm_engage():
+    """重新接管: release the motion mode again and hold at the current pose."""
+    if arm_controller is None:
+        return JSONResponse({"success": False, "error": "arm control disabled"}, status_code=409)
+    await asyncio.to_thread(arm_controller.reengage)
+    return {"success": True}
+
+
 @app.post("/api/arm/handmove")
 async def api_arm_handmove():
     """Enter compliant hand-guide mode (right arm goes soft). Operator MUST support it."""

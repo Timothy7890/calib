@@ -59,12 +59,18 @@
           </span>
           <span class="arm-state warn" v-if="armFloat">手调松力中</span>
           <div class="arm-buttons">
-            <button v-if="!armJog" class="arm-btn enable" @click="enableArm">
-              {{ armFloat ? '使能 jog(接住)' : '使能 jog' }}
-            </button>
-            <button v-else class="arm-btn disable" @click="disableArm">关闭 jog(保持)</button>
-            <button v-if="!armJog && !armFloat" class="arm-btn handmove" @click="handMoveArm">进入手调(松力)</button>
-            <button class="arm-btn estop" @click="stopArm">急停(冻结)</button>
+            <template v-if="armEngaged">
+              <button v-if="!armJog" class="arm-btn enable" @click="enableArm">
+                {{ armFloat ? '使能 jog(接住)' : '使能 jog' }}
+              </button>
+              <button v-else class="arm-btn disable" @click="disableArm">关闭 jog(保持)</button>
+              <button v-if="!armJog && !armFloat" class="arm-btn handmove" @click="handMoveArm">进入手调(松力)</button>
+              <button class="arm-btn estop" @click="stopArm">急停(冻结)</button>
+              <button v-if="!armFloat" class="arm-btn release" @click="releaseArm">放弃接管(交还)</button>
+            </template>
+            <template v-else>
+              <button class="arm-btn enable" @click="engageArm">重新接管(持位)</button>
+            </template>
           </div>
         </div>
         <div v-if="armFloat" class="float-warning">
@@ -121,7 +127,7 @@
         <span v-if="capturing">采集中...</span>
         <span v-else-if="!jointsOk">等待关节数据...</span>
         <span v-else-if="!leftDetected && !allowNoCorners">等待棋盘格...</span>
-        <span v-else>采集 (图像 + 关节)</span>
+        <span v-else>采集 (图像 + 关节) [空格]</span>
       </button>
       <label class="status-item toggle force-toggle">
         <input type="checkbox" v-model="allowNoCorners" />
@@ -406,6 +412,25 @@ async function handMoveArm() {
   }
   await pollArm(true)
 }
+async function releaseArm() {
+  if (!confirm('放弃接管:停止低层持位,手臂交还给机器人本体控制器(可能会移动)。\n请先扶稳手臂,确认继续?')) return
+  try {
+    const res = await fetch('/api/arm/release', { method: 'POST' })
+    const data = await res.json().catch(() => ({}))
+    if (!res.ok || data.success === false) {
+      alert('放弃接管失败: ' + (data.error || res.status))
+    } else if (!data.restored_mode) {
+      alert('已停止低层控制,但没有可恢复的运动模式(启动时未释放任何模式)。手臂当前无人控制,请扶住!')
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message)
+  }
+  await pollArm(true)
+}
+async function engageArm() {
+  await fetch('/api/arm/engage', { method: 'POST' })
+  await pollArm(true)
+}
 
 let armTimer = null
 async function pollArm(syncDesired = false) {
@@ -481,6 +506,14 @@ async function deleteTcp(index) {
   }
 }
 
+function onKeydown(e) {
+  if (e.code !== 'Space') return
+  const t = e.target
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return
+  e.preventDefault()
+  if (canCapture.value && !capturing.value) captureFrame()
+}
+
 onMounted(() => {
   loadStatus()
   connectWebSocket()
@@ -490,12 +523,14 @@ onMounted(() => {
   pollArm(true)
   armTimer = setInterval(pollArm, 400)
   loadTcp()
+  window.addEventListener('keydown', onKeydown)
 })
 
 onUnmounted(() => {
   if (ws) ws.close()
   if (jointsTimer) clearInterval(jointsTimer)
   if (armTimer) clearInterval(armTimer)
+  window.removeEventListener('keydown', onKeydown)
 })
 </script>
 
@@ -712,6 +747,7 @@ onUnmounted(() => {
 .arm-btn.disable { background: #3a6ea5; }
 .arm-btn.estop { background: #e53935; }
 .arm-btn.handmove { background: #b9770a; }
+.arm-btn.release { background: #6b5b95; }
 .float-warning {
   margin-top: 12px;
   padding: 10px 14px;

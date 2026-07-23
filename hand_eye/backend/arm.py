@@ -91,6 +91,34 @@ class ArmController:
     def shutdown(self) -> None:
         self._stop.set()
 
+    def release_takeover(self) -> Optional[str]:
+        """放弃接管: stop streaming rt/lowcmd and hand control back to the body
+        controller (the motion mode released at startup). SUPPORT THE ARM —
+        the body controller will take over and may move it."""
+        with self._lock:
+            self._engaged = False
+            self._jog_enabled = False
+            self._float = False
+        # Let the 200Hz loop observe _engaged=False before the mode switches.
+        time.sleep(2.0 * self._dt)
+        return self._executor.restore_motion_mode()
+
+    def reengage(self) -> bool:
+        """重新接管: release the motion mode again and resume holding at the
+        CURRENT measured pose (jog stays locked until enable_jog)."""
+        if self._engaged:
+            return True
+        self._executor.release_motion_mode()
+        q0 = self._safe_measured()
+        with self._lock:
+            if q0 is not None:
+                self._cmd_q = q0
+            self._desired_q = self._cmd_q.copy()
+            self._jog_enabled = False
+            self._float = False
+            self._engaged = True
+        return True
+
     # ----- helpers -----
 
     def _clamp(self, q) -> np.ndarray:

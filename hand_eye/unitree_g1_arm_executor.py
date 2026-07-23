@@ -317,18 +317,10 @@ class UnitreeG1ArmExecutor:
         else:
             ChannelFactoryInitialize(0)
 
+        self._msc = None
+        self.released_mode_name: Optional[str] = None
         if release_motion_mode:
-            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
-
-            msc = MotionSwitcherClient()
-            msc.SetTimeout(5.0)
-            msc.Init()
-            status, result = msc.CheckMode()
-            while isinstance(result, dict) and result.get("name"):
-                print(f"[unitree_arm] releasing active motion mode: {result}")
-                msc.ReleaseMode()
-                time.sleep(1.0)
-                status, result = msc.CheckMode()
+            self.release_motion_mode()
 
         self.crc = CRC()
         self.low_cmd = unitree_hg_msg_dds__LowCmd_()
@@ -337,6 +329,47 @@ class UnitreeG1ArmExecutor:
         self.lowstate_subscriber = ChannelSubscriber("rt/lowstate", LowState_)
         self.lowstate_subscriber.Init(self._low_state_handler, 10)
         self.wait_for_low_state()
+
+    # ----- motion-mode takeover management -----
+
+    def _motion_switcher(self):
+        if self._msc is None:
+            from unitree_sdk2py.comm.motion_switcher.motion_switcher_client import MotionSwitcherClient
+
+            self._msc = MotionSwitcherClient()
+            self._msc.SetTimeout(5.0)
+            self._msc.Init()
+        return self._msc
+
+    def release_motion_mode(self) -> Optional[str]:
+        """Release the robot's high-level motion mode so rt/lowcmd takes effect.
+
+        Remembers the released mode name so restore_motion_mode() can hand
+        control back later.
+        """
+        msc = self._motion_switcher()
+        status, result = msc.CheckMode()
+        while isinstance(result, dict) and result.get("name"):
+            self.released_mode_name = result.get("name")
+            print(f"[unitree_arm] releasing active motion mode: {result}")
+            msc.ReleaseMode()
+            time.sleep(1.0)
+            status, result = msc.CheckMode()
+        return self.released_mode_name
+
+    def restore_motion_mode(self, mode_name: Optional[str] = None) -> Optional[str]:
+        """Hand control back to the robot's body controller (mode released earlier).
+
+        The caller MUST stop streaming rt/lowcmd before calling this, and the
+        operator should support the arm: the body controller will take over.
+        """
+        name = mode_name or self.released_mode_name
+        if not name:
+            return None
+        msc = self._motion_switcher()
+        print(f"[unitree_arm] restoring motion mode: {name}")
+        msc.SelectMode(name)
+        return name
 
     def _low_state_handler(self, msg) -> None:
         self.low_state = msg
@@ -401,12 +434,9 @@ class UnitreeG1ArmExecutor:
             self.low_cmd.motor_cmd[i].kp = Kp[i]
             self.low_cmd.motor_cmd[i].kd = Kd[i]
 
-        for idx in WAIST_MOTOR_INDICES:
-            self.low_cmd.motor_cmd[idx].q = 0.0
-            self.low_cmd.motor_cmd[idx].dq = 0.0
-            self.low_cmd.motor_cmd[idx].kp = Kp[idx]
-            self.low_cmd.motor_cmd[idx].kd = Kd[idx]
-            self.low_cmd.motor_cmd[idx].tau = 0.0
+        # NOTE: waist motors (12/13/14) are intentionally NOT forced to zero here.
+        # They are held at their measured positions by the loop above, so an
+        # operator-adjusted torso pose is preserved instead of snapping back.
 
         for name, q_value in zip(joint_names, q_cmd):
             idx = self._motor_index(name)
@@ -415,6 +445,38 @@ class UnitreeG1ArmExecutor:
             self.low_cmd.motor_cmd[idx].kp = Kp[idx]
             self.low_cmd.motor_cmd[idx].kd = Kd[idx]
             self.low_cmd.motor_cmd[idx].tau = 0.0
+
+        self.low_cmd.crc = self.crc.Crc(self.low_cmd)
+        self.lowcmd_publisher.Write(self.low_cmd)
+
+    def send_compliant_arm_once(
+        self,
+        joint_names: Sequence[str] = RIGHT_ARM_JOINT_NAMES,
+        kd: float = 2.0,
+    ) -> None:
+        """Stream one frame with the given arm joints SOFT (kp=0, small kd) for
+        hand guiding. All other motors (incl. waist) hold their measured pose.
+
+        No gravity compensation: the operator must support the arm.
+        """
+        self.wait_for_low_state()
+        self.low_cmd.mode_pr = Mode.PR
+        self.low_cmd.mode_machine = self.mode_machine
+
+        for i in range(G1_NUM_MOTOR):
+            self.low_cmd.motor_cmd[i].mode = 1
+            self.low_cmd.motor_cmd[i].tau = 0.0
+            self.low_cmd.motor_cmd[i].q = self.low_state.motor_state[i].q
+            self.low_cmd.motor_cmd[i].dq = 0.0
+            self.low_cmd.motor_cmd[i].kp = Kp[i]
+            self.low_cmd.motor_cmd[i].kd = Kd[i]
+
+        for name in joint_names:
+            idx = self._motor_index(name)
+            self.low_cmd.motor_cmd[idx].kp = 0.0
+            self.low_cmd.motor_cmd[idx].kd = float(kd)
+            self.low_cmd.motor_cmd[idx].tau = 0.0
+            self.low_cmd.motor_cmd[idx].dq = 0.0
 
         self.low_cmd.crc = self.crc.Crc(self.low_cmd)
         self.lowcmd_publisher.Write(self.low_cmd)
