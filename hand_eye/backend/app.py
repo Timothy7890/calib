@@ -474,6 +474,35 @@ def _sessions_base() -> Path:
     return save_path
 
 
+def _session_resolution(data_dir: Path) -> Optional[Tuple[int, int]]:
+    """(width, height) of the first captured left image, or None."""
+    left_dir = data_dir / "left"
+    if not left_dir.is_dir():
+        return None
+    for f in sorted(left_dir.glob("*.jpg")):
+        img = cv2.imread(str(f))
+        if img is not None:
+            h, w = img.shape[:2]
+            return (w, h)
+    return None
+
+
+def _intrinsics_resolution(yaml_path: Path) -> Optional[Tuple[int, int]]:
+    """(width, height) recorded in a stereo_calibration.yaml, or None."""
+    try:
+        fs = cv2.FileStorage(str(yaml_path), cv2.FILE_STORAGE_READ)
+        if not fs.isOpened():
+            return None
+        w = fs.getNode("image_width").real()
+        h = fs.getNode("image_height").real()
+        fs.release()
+        if w and h and w > 0 and h > 0:
+            return (int(w), int(h))
+    except cv2.error:
+        pass
+    return None
+
+
 @app.get("/api/solve/sessions")
 async def api_solve_sessions():
     base = _sessions_base()
@@ -493,11 +522,13 @@ async def api_solve_sessions():
                     board = json.loads(meta_f.read_text()).get("board_size", "")
                 except (OSError, json.JSONDecodeError):
                     pass
+            res = _session_resolution(d)
             sessions.append({
                 "name": d.name,
                 "n_images": n_images,
                 "n_joints": n_joints,
                 "board_size": board,
+                "resolution": f"{res[0]}x{res[1]}" if res else "",
                 "has_result": has_result,
                 "is_current": d.resolve() == save_path.resolve(),
             })
@@ -513,7 +544,12 @@ async def api_solve_intrinsics():
         for d in sorted(calib_images.iterdir(), reverse=True):
             f = d / "stereo_calibration.yaml"
             if d.is_dir() and f.exists():
-                items.append({"label": d.name, "path": str(f)})
+                res = _intrinsics_resolution(f)
+                items.append({
+                    "label": d.name,
+                    "path": str(f),
+                    "resolution": f"{res[0]}x{res[1]}" if res else "",
+                })
     return {"items": items}
 
 
@@ -588,6 +624,24 @@ async def api_solve(body: dict):
     intrinsics = str(body.get("intrinsics", "")).strip()
     if not intrinsics or not Path(intrinsics).exists():
         return JSONResponse({"success": False, "error": f"内参文件不存在: {intrinsics}"}, status_code=400)
+
+    # 防呆:内参标定分辨率必须与该会话图像分辨率一致(内参不能跨分辨率使用)。
+    sess_res = _session_resolution(data_dir)
+    intr_res = _intrinsics_resolution(Path(intrinsics))
+    if sess_res is None:
+        return JSONResponse({"success": False, "error": f"{data_dir} 的 left/ 里没有可读图像"}, status_code=400)
+    if intr_res is not None and sess_res != intr_res:
+        return JSONResponse(
+            {
+                "success": False,
+                "error": (
+                    f"分辨率不匹配:会话图像为 {sess_res[0]}x{sess_res[1]},"
+                    f"但所选内参标定于 {intr_res[0]}x{intr_res[1]}。"
+                    f"请选择相同分辨率的 stereo_calibration.yaml。"
+                ),
+            },
+            status_code=400,
+        )
 
     try:
         square = float(body.get("square_size_mm"))

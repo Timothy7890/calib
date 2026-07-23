@@ -191,7 +191,7 @@
         <label>采集目录:
           <select v-model="solveSessionSel" class="tcp-select solve-select">
             <option v-for="s in solveSessions" :key="s.name" :value="s.name">
-              {{ s.name }}{{ s.is_current ? ' (当前)' : '' }} · {{ s.n_images }}图/{{ s.n_joints }}关节{{ s.has_result ? ' · 已有结果' : '' }}
+              {{ s.name }}{{ s.is_current ? ' (当前)' : '' }}{{ s.resolution ? ' · ' + s.resolution : '' }} · {{ s.n_images }}图/{{ s.n_joints }}关节{{ s.has_result ? ' · 已有结果' : '' }}
             </option>
           </select>
         </label>
@@ -201,7 +201,7 @@
         <label>双目内参:
           <select v-model="solveIntrinsicsSel" class="tcp-select solve-select">
             <option v-for="it in solveIntrinsicsList" :key="it.path" :value="it.path">
-              {{ it.label }}
+              {{ it.label }}{{ it.resolution ? ' · ' + it.resolution : '' }}
             </option>
             <option value="__custom__">自定义路径...</option>
           </select>
