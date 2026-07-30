@@ -64,15 +64,30 @@ def main() -> int:
     from backend.camera import CameraManager
     from backend.detection import parse_board_size
 
+    # Connect the camera first so the session dir name can carry the
+    # per-eye resolution, e.g. 20260722164203_1280x720.
+    camera = CameraManager(host=args.camera_host)
+    resolution = ""
+    pair = camera.grab(timeout=5.0)
+    if pair is not None:
+        h, w = pair[0].shape[:2]
+        resolution = f"{w}x{h}"
+    else:
+        print("[calib] WARNING: no frame received yet; session dir will omit resolution")
+
     session_dir = Path(args.save_path)
     if not args.no_timestamp_dir:
-        session_dir = session_dir / datetime.now().strftime("%Y%m%d%H%M%S")
+        dir_name = datetime.now().strftime("%Y%m%d%H%M%S")
+        if resolution:
+            dir_name += f"_{resolution}"
+        session_dir = session_dir / dir_name
 
     # Replicate the sub-app's lifespan setup manually, because a mounted
     # sub-app's lifespan handler does not run automatically.
     calib.save_path = session_dir
     calib.board_size = parse_board_size(args.board_size)
-    calib.camera = CameraManager(host=args.camera_host)
+    calib.camera = camera
+    calib.resolution = resolution
     (session_dir / "left").mkdir(parents=True, exist_ok=True)
     (session_dir / "right").mkdir(parents=True, exist_ok=True)
     calib.capture_count = calib._count_existing_captures()
@@ -82,6 +97,7 @@ def main() -> int:
 
     print(f"[calib] camera_host = {args.camera_host}")
     print(f"[calib] board_size  = {args.board_size}")
+    print(f"[calib] resolution  = {resolution or 'unknown'} (per eye)")
     print(f"[calib] save_path   = {session_dir}")
     print(f"[calib] existing captures = {calib.capture_count}")
     print(f"[calib] serving /calibrate on http://{args.host}:{args.port}")

@@ -46,8 +46,9 @@ def main() -> int:
     parser.add_argument("--arm-control", action="store_true",
                         help="Enable right-arm jog control from the web UI (REAL MOTION). "
                              "Reads joints from the same executor; ignores --joint-source.")
-    parser.add_argument("--urdf", default=str(Path(__file__).resolve().parents[2] / "g1_d.urdf"),
-                        help="URDF path (for joint limits used by --arm-control)")
+    parser.add_argument("--urdf",
+                        default=str(Path(__file__).resolve().parents[1] / "ROBOT_FILE" / "G1D" / "g1_d.urdf"),
+                        help="URDF path (joint limits for --arm-control, FK for one-click solve)")
     parser.add_argument("--base-link", default="torso_link", help="URDF base link (for joint limits)")
     parser.add_argument("--tip-link", default="right_dex1_tool_link", help="URDF tip link (for joint limits)")
     parser.add_argument("--max-joint-speed", type=float, default=0.2,
@@ -108,6 +109,9 @@ def main() -> int:
     app_module.joint_provider = joint_provider
     app_module.save_path = session_dir
     app_module.board_size = parse_board_size(args.board_size)
+    app_module.urdf_path = str(Path(args.urdf).resolve())
+    app_module.base_link = args.base_link
+    app_module.tip_link = args.tip_link
     app_module.init_state()
 
     print(f"[handeye] save_path     = {session_dir}")

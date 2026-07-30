@@ -19,6 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse
 
 from .camera import CameraManager
 from .detection import detect_corners, parse_board_size
+from .calibrate import run_calibration
 
 # --------------- Global State ---------------
 
@@ -26,6 +27,10 @@ camera: Optional[CameraManager] = None
 save_path: Path = Path("./calib_images")
 board_size: Tuple[int, int] = (9, 6)
 capture_count: int = 0
+resolution: str = ""  # per-eye resolution "WxH", updated from live frames
+
+# One calibration job at a time; polled by the frontend.
+calib_job: dict = {"running": False, "session": None, "log": [], "result": None, "error": None}
 
 
 def _count_existing_captures() -> int:
@@ -98,6 +103,7 @@ async def ws_stream(ws: WebSocket):
 
     recv_task = asyncio.create_task(receive_commands())
 
+    global resolution
     try:
         while True:
             pair = await asyncio.to_thread(camera.grab, 2.0)
@@ -106,6 +112,8 @@ async def ws_stream(ws: WebSocket):
                 continue
 
             left, right = pair
+            h, w = left.shape[:2]
+            resolution = f"{w}x{h}"
             left_detected, left_display = detect_corners(left, local_board_size, draw=show_corners)
             right_detected, right_display = detect_corners(right, local_board_size, draw=show_corners)
 
@@ -115,6 +123,7 @@ async def ws_stream(ws: WebSocket):
                 "left_detected": left_detected,
                 "right_detected": right_detected,
                 "count": capture_count,
+                "resolution": resolution,
             })
             await ws.send_text(payload)
             await asyncio.sleep(0.02)
@@ -127,15 +136,61 @@ async def ws_stream(ws: WebSocket):
 # --------------- REST API ---------------
 
 
+def _session_resolution() -> str:
+    """Resolution of images already in this session ('' if empty session)."""
+    meta_file = save_path / "capture_info.json"
+    if meta_file.exists():
+        try:
+            res = json.loads(meta_file.read_text()).get("resolution", "")
+            if res:
+                return res
+        except (OSError, json.JSONDecodeError):
+            pass
+    files = sorted((save_path / "left").glob("*.jpg"))
+    if files:
+        img = cv2.imread(str(files[0]))
+        if img is not None:
+            h, w = img.shape[:2]
+            return f"{w}x{h}"
+    return ""
+
+
+def _write_capture_meta(res_str: str):
+    """Persist capture session metadata (resolution etc.) next to the images."""
+    meta = {
+        "resolution": res_str,
+        "board_size": f"{board_size[0]}x{board_size[1]}",
+    }
+    try:
+        with open(save_path / "capture_info.json", "w") as f:
+            json.dump(meta, f, indent=2)
+    except OSError:
+        pass
+
+
 @app.post("/api/capture")
 async def api_capture():
     """Capture current frame and save to disk."""
-    global capture_count
+    global capture_count, resolution
     pair = await asyncio.to_thread(camera.grab, 3.0)
     if pair is None:
         return JSONResponse({"success": False, "error": "No frame available"}, status_code=503)
 
     left, right = pair
+    h, w = left.shape[:2]
+    resolution = f"{w}x{h}"
+
+    # Reject captures whose resolution differs from images already in this
+    # session (e.g. teleimager was reconfigured after the session started).
+    session_res = _session_resolution()
+    if session_res and session_res != resolution:
+        return JSONResponse({
+            "success": False,
+            "error": (f"分辨率不一致：当前相机为 {resolution}，"
+                      f"本会话已有 {session_res} 的图像。"
+                      f"请重启采集服务开始新会话后再拍摄。"),
+        }, status_code=409)
+
     idx_str = f"{capture_count:04d}"
     (save_path / "left").mkdir(parents=True, exist_ok=True)
     (save_path / "right").mkdir(parents=True, exist_ok=True)
@@ -144,7 +199,8 @@ async def api_capture():
     if not ok_l or not ok_r:
         return JSONResponse({"success": False, "error": "Failed to write image files"}, status_code=500)
     capture_count += 1
-    return {"success": True, "index": capture_count - 1, "count": capture_count}
+    _write_capture_meta(resolution)
+    return {"success": True, "index": capture_count - 1, "count": capture_count, "resolution": resolution}
 
 
 @app.get("/api/history")
@@ -188,6 +244,7 @@ async def api_status():
         "count": capture_count,
         "board_size": f"{board_size[0]}x{board_size[1]}",
         "save_path": str(save_path),
+        "resolution": resolution,
     }
 
 
@@ -198,3 +255,79 @@ async def api_config(body: dict):
     if "board_size" in body:
         board_size = parse_board_size(body["board_size"])
     return {"board_size": f"{board_size[0]}x{board_size[1]}"}
+
+
+# --------------- Calibration Compute ---------------
+
+
+def _sessions_base() -> Path:
+    """Base directory containing capture session folders."""
+    return save_path.parent
+
+
+@app.get("/api/sessions")
+async def api_sessions():
+    """List capture session directories (newest first)."""
+    base = _sessions_base()
+    sessions = []
+    if base.exists():
+        for d in sorted(base.iterdir(), reverse=True):
+            left_dir = d / "left"
+            if not d.is_dir() or not left_dir.exists():
+                continue
+            meta = {}
+            meta_file = d / "capture_info.json"
+            if meta_file.exists():
+                try:
+                    meta = json.loads(meta_file.read_text())
+                except (OSError, json.JSONDecodeError):
+                    pass
+            sessions.append({
+                "name": d.name,
+                "count": len(list(left_dir.glob("*.jpg"))),
+                "resolution": meta.get("resolution", ""),
+                "calibrated": (d / "stereo_calibration.yaml").exists(),
+                "current": d.resolve() == save_path.resolve(),
+            })
+    return {"sessions": sessions}
+
+
+def _run_calib_job(session_dir: Path, bs: Tuple[int, int], square: float):
+    def log(msg):
+        calib_job["log"].append(str(msg))
+    try:
+        calib_job["result"] = run_calibration(session_dir, bs, square, log=log)
+    except Exception as e:  # surfaced to the frontend
+        calib_job["error"] = str(e)
+    finally:
+        calib_job["running"] = False
+
+
+@app.post("/api/calibrate")
+async def api_calibrate(body: dict):
+    """Start a stereo calibration job on a captured session folder."""
+    global calib_job
+    if calib_job["running"]:
+        return JSONResponse({"success": False, "error": "已有标定任务在运行中"}, status_code=409)
+
+    session = str(body.get("session", "")).strip()
+    base = _sessions_base().resolve()
+    session_dir = (base / session).resolve()
+    if not session or base not in session_dir.parents or not (session_dir / "left").exists():
+        return JSONResponse({"success": False, "error": f"无效的会话目录: {session}"}, status_code=400)
+
+    try:
+        bs = parse_board_size(str(body.get("board_size", f"{board_size[0]}x{board_size[1]}")))
+        square = float(body.get("square_size", 30))
+    except ValueError as e:
+        return JSONResponse({"success": False, "error": str(e)}, status_code=400)
+
+    calib_job = {"running": True, "session": session, "log": [], "result": None, "error": None}
+    asyncio.create_task(asyncio.to_thread(_run_calib_job, session_dir, bs, square))
+    return {"success": True, "session": session}
+
+
+@app.get("/api/calibrate/status")
+async def api_calibrate_status():
+    """Poll the current calibration job."""
+    return calib_job
