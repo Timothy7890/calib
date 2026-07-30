@@ -285,9 +285,12 @@ class OrbbecRGBDCamera(CameraBase):
         return buf.tobytes() if ok else None
 
     def pick(self, u: int, v: int, win: int = 5) -> dict:
-        """像素 (u,v) 周围 win×win 窗口、最近多帧深度取中值后反投影。
+        """严格取像素 (u,v) 本身的深度（只做多帧时域中值，不做空间外扩）。
 
-        返回彩色相机坐标系下坐标（米）。深度无效比例过高时报错。
+        以前用 5×5 空间窗口，点指尖尖端时窗口跨轮廓、被背景"多数票"带走
+        （指尖本身常因黑色/细小/反光在深度图里是空洞，窗口里能投票的全是
+        背景）。现在就用你点中的那一个像素：8 帧里有效帧不足直接报错，
+        绝不拿邻近/背景值顶替。返回彩色相机坐标系下坐标（米）。
         """
         if self.intrinsics is None:
             return {"ok": False, "error": "相机未就绪"}
@@ -299,18 +302,20 @@ class OrbbecRGBDCamera(CameraBase):
         h, w = hist[0].shape
         if not (0 <= u < w and 0 <= v < h):
             return {"ok": False, "error": f"像素越界 ({u},{v})，深度图 {w}x{h}"}
-        r = max(1, win // 2)
-        u0, u1 = max(0, u - r), min(w, u + r + 1)
-        v0, v1 = max(0, v - r), min(h, v + r + 1)
 
-        patch = np.stack([d[v0:v1, u0:u1] for d in hist])  # (帧, 行, 列)
-        valid = patch[(patch > 60) & (patch < 15000)]
-        total = patch.size
-        if valid.size < total * 0.2:
+        vals = np.array([d[v, u] for d in hist], dtype=float)
+        valid = vals[(vals > 60) & (vals < 15000)]
+        if valid.size < max(3, len(vals) // 2):
             return {"ok": False,
-                    "error": f"该点深度大量无效（{valid.size}/{total}），"
-                             "可能是边缘飞点/反光/空洞，换个位置点"}
+                    "error": f"该像素没有稳定深度（{valid.size}/{len(vals)} 帧有效）。"
+                             "细小/深色/反光表面双目常测不到——可在指尖贴一小块"
+                             "哑光贴纸，或点指腹等有深度的位置"}
+        spread = float(np.max(valid) - np.min(valid))
         z_mm = float(np.median(valid))
+        if spread > 80.0:
+            return {"ok": False,
+                    "error": f"该像素深度在多帧间跳动 {spread:.0f}mm（边缘闪烁），"
+                             "稍微挪一点再点"}
         z = z_mm / 1000.0
         fx, fy, cx, cy = self.intrinsics
         p = [(u - cx) * z / fx, (v - cy) * z / fy, z]
@@ -318,7 +323,7 @@ class OrbbecRGBDCamera(CameraBase):
             "ok": True,
             "p_camera": p,
             "depth_mm": z_mm,
-            "valid_ratio": float(valid.size / total),
+            "valid_ratio": float(valid.size / len(vals)),
             "pixel": [u, v],
         }
 

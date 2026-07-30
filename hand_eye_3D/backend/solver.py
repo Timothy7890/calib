@@ -181,6 +181,123 @@ def solve_with_tool_offset(p_camera: np.ndarray, T_wrist: np.ndarray,
     return result
 
 
+MIN_SAMPLES_TOOL_ONLY = 3
+
+
+def solve_tool_fixed_cam(p_camera: np.ndarray, T_wrist: np.ndarray,
+                         R_cam2base: np.ndarray, t_cam2base: np.ndarray) -> dict:
+    """固定相机外参，只解指尖偏移 p_tool（腕系）。
+
+    已有可信的 T_base^camera 时用这个：每个样本给 3 个方程、只有 3 个未知量，
+    线性最小二乘一步解出，样本少也稳。约束:
+        R_w_i @ p_tool + t_w_i = R @ p_cam_i + t
+    与联合解不同，这里 p_tool 单独可辨识，姿态跨度不是硬性要求——但跨度越大，
+    解出的 p_tool 对姿态变化越鲁棒（能暴露"换姿态就偏"的问题），仍建议转开。
+    """
+    p_camera = np.asarray(p_camera, dtype=float).reshape(-1, 3)
+    T_wrist = np.asarray(T_wrist, dtype=float).reshape(-1, 4, 4)
+    n = len(p_camera)
+    if len(T_wrist) != n:
+        raise ValueError(f"点数不一致: camera {n} vs wrist {len(T_wrist)}")
+    if n < MIN_SAMPLES_TOOL_ONLY:
+        raise ValueError(f"至少需要 {MIN_SAMPLES_TOOL_ONLY} 个样本，当前 {n} 个")
+    R = np.asarray(R_cam2base, dtype=float).reshape(3, 3)
+    t = np.asarray(t_cam2base, dtype=float).reshape(3)
+
+    R_w = T_wrist[:, :3, :3]
+    t_w = T_wrist[:, :3, 3]
+    target = (R @ p_camera.T).T + t - t_w        # (N,3) = R_w_i @ p_tool 应等于的值
+    A = R_w.reshape(-1, 3)
+    b = target.reshape(-1)
+    p_tool, *_ = np.linalg.lstsq(A, b, rcond=None)
+
+    errors_mm = np.linalg.norm((R_w @ p_tool) - target, axis=1) * 1000.0
+    max_rot = max((geodesic_deg(R_w[0], R_w[i]) for i in range(1, n)), default=0.0)
+    return {
+        "mode": "tool_only_fixed_cam",
+        "num_samples": n,
+        "p_tool_wrist_m": p_tool.tolist(),
+        "wrist_rotation_spread_deg": max_rot,
+        "residual_mm": {
+            "per_sample": errors_mm.tolist(),
+            "rms": float(np.sqrt((errors_mm ** 2).mean())),
+            "mean": float(errors_mm.mean()),
+            "max": float(errors_mm.max()),
+        },
+    }
+
+
+MIN_SAMPLES_PIVOT = 4
+MIN_PIVOT_ROT_DEG = 25.0   # 姿态转开才能把 p_tool 的横向分量解出来
+
+
+def solve_pivot(T_wrist: np.ndarray) -> dict:
+    """尖点标定（pivot calibration）：指尖从多个姿态触碰同一个固定点。
+
+    约束: R_w_i @ p_tool + t_w_i = q（固定点，基座系，未知）。
+    线性最小二乘 [R_i | -I] [p_tool; q] = -t_i，一次解出 p_tool 和 q。
+    不需要相机——只用手腕 FK 位姿。姿态转得越开（务必包含反手/大角度
+    roll），p_tool 越可信；残差直接反映"指尖并没真正钉在同一点上"的程度。
+    """
+    T_wrist = np.asarray(T_wrist, dtype=float).reshape(-1, 4, 4)
+    n = len(T_wrist)
+    if n < MIN_SAMPLES_PIVOT:
+        raise ValueError(f"尖点标定至少需要 {MIN_SAMPLES_PIVOT} 个姿态，当前 {n} 个")
+    R_w = T_wrist[:, :3, :3]
+    t_w = T_wrist[:, :3, 3]
+
+    max_rot = max(geodesic_deg(R_w[0], R_w[i]) for i in range(1, n))
+    if max_rot < MIN_PIVOT_ROT_DEG:
+        raise ValueError(
+            f"手腕姿态变化只有 {max_rot:.1f}°（需要 ≥ {MIN_PIVOT_ROT_DEG}°），"
+            "请把手腕转开（含反手大角度 roll）再采样，否则指尖偏移解不出来")
+
+    A = np.zeros((3 * n, 6))
+    b = np.zeros(3 * n)
+    for i in range(n):
+        A[3 * i:3 * i + 3, :3] = R_w[i]
+        A[3 * i:3 * i + 3, 3:] = -np.eye(3)
+        b[3 * i:3 * i + 3] = -t_w[i]
+    x, *_ = np.linalg.lstsq(A, b, rcond=None)
+    p_tool, q = x[:3], x[3:]
+
+    errors_mm = np.linalg.norm((R_w @ p_tool) + t_w - q, axis=1) * 1000.0
+    return {
+        "mode": "pivot",
+        "num_samples": n,
+        "p_tool_wrist_m": p_tool.tolist(),
+        "pivot_point_base_m": q.tolist(),
+        "wrist_rotation_spread_deg": max_rot,
+        "residual_mm": {
+            "per_sample": errors_mm.tolist(),
+            "rms": float(np.sqrt((errors_mm ** 2).mean())),
+            "mean": float(errors_mm.mean()),
+            "max": float(errors_mm.max()),
+        },
+    }
+
+
+def leave_one_out_pivot(T_wrist: np.ndarray) -> list[float]:
+    """尖点标定的留一验证：剔除样本 i 解算，再看该姿态下预测指尖与固定点差多少（毫米）。"""
+    T_wrist = np.asarray(T_wrist, dtype=float).reshape(-1, 4, 4)
+    n = len(T_wrist)
+    if n < MIN_SAMPLES_PIVOT + 1:
+        return []
+    errors = []
+    for i in range(n):
+        mask = np.arange(n) != i
+        try:
+            res = solve_pivot(T_wrist[mask])
+        except ValueError:
+            errors.append(float("nan"))
+            continue
+        p = np.array(res["p_tool_wrist_m"])
+        q = np.array(res["pivot_point_base_m"])
+        pred = T_wrist[i, :3, :3] @ p + T_wrist[i, :3, 3]
+        errors.append(float(np.linalg.norm(pred - q) * 1000.0))
+    return errors
+
+
 def leave_one_out_tool(p_camera: np.ndarray, T_wrist: np.ndarray) -> list[float]:
     """联合解的留一交叉验证（毫米）。"""
     p_camera = np.asarray(p_camera, dtype=float).reshape(-1, 3)

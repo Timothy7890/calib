@@ -37,6 +37,27 @@ IK_REPLAY_ROOT = Path("/home/robot/yx/project/IK_replay")
 # 来源: eai_teleoperate_studio/tools/h2_official_arm_sdk_control.py 的 H2JointIndex）
 H2_RIGHT_ARM_MOTOR_INDICES = [22, 23, 24, 25, 26, 27, 28]
 H2_LEFT_ARM_MOTOR_INDICES = [15, 16, 17, 18, 19, 20, 21]
+H2_WAIST_MOTOR_INDICES = [12, 13, 14]
+H2_WAIST_JOINT_NAMES = ["waist_yaw", "waist_roll", "waist_pitch"]
+
+
+def read_torso_state(low_state) -> dict:
+    """从一帧 rt/lowstate 里取躯干姿态：腰三关节 + IMU 姿态。
+
+    手臂 IK 全部在 torso_link 系下解算，隐含假设"躯干不动"。本体控制器
+    在运动模式下会为了平衡而动腰/踝，手抬起来时躯干可能后仰几度——
+    那样即使手臂关节角完全到位，指尖在世界系里也偏了。这个函数负责
+    把"躯干到底动了多少"如实读出来，供执行前后对比。
+    """
+    imu = getattr(low_state, "imu_state", None)
+    quat = [float(v) for v in getattr(imu, "quaternion", [1.0, 0.0, 0.0, 0.0])]
+    rpy = [float(v) for v in getattr(imu, "rpy", [0.0, 0.0, 0.0])]
+    return {
+        "waist_rad": [float(low_state.motor_state[i].q) for i in H2_WAIST_MOTOR_INDICES],
+        "waist_names": list(H2_WAIST_JOINT_NAMES),
+        "imu_quat": quat,
+        "imu_rpy": rpy,
+    }
 
 
 class PoseProvider:
@@ -162,6 +183,20 @@ class H2PoseProvider(PoseProvider):
         if state is None:
             raise RuntimeError("还没收到 rt/lowstate")
         return np.asarray([state.motor_state[i].q for i in self._motor_indices], dtype=float)
+
+    def read_torso_state(self) -> dict:
+        """腰关节 + IMU 姿态（只读）。没有自建订阅时返回 None。"""
+        with self._lock:
+            state = self._low_state
+        return read_torso_state(state) if state is not None else None
+
+    def read_motor_q(self, indices) -> list | None:
+        """按全身电机序号读任意电机角度（rad，只读）。还没收到帧返回 None。"""
+        with self._lock:
+            state = self._low_state
+        if state is None:
+            return None
+        return [float(state.motor_state[int(i)].q) for i in indices]
 
     def read_pose(self) -> np.ndarray:
         q = self.read_arm_q()

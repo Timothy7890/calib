@@ -11,6 +11,14 @@
 - 退出时权重 1 秒渐出交还本体控制器——退出前请扶住手臂。
 
 只点动一条手臂（--arm），另一条手臂全程保持在启动时的实测姿态。
+
+重力前馈
+--------
+关节低层只有 kp/kd 两项，没有积分，纯 PD 想托住手臂自重只能靠"位置偏差×kp"，
+所以手臂必然停在低于目标几度的地方（这正是之前"抬不到位、够不着开关"的根因）。
+每周期按当前指令角算出托举力矩 τ_g(q) 直接前馈进去，PD 就只负责消误差而不用
+扛重力，稳态偏差从几度降到零点几度。算法与官方 VR 遥操（xr_teleoperate 的
+pinocchio RNEA）一致，已逐点对拍到 1e-15 Nm，见 tools/check_gravity.py。
 """
 
 from __future__ import annotations
@@ -23,10 +31,12 @@ from pathlib import Path
 import numpy as np
 
 from .dds import ensure_dds_initialized
+from .gravity import ArmGravityModel, gravity_dir_from_quaternion, parse_effort_limits
 from .robot import (
     H2_LEFT_ARM_MOTOR_INDICES,
     H2_RIGHT_ARM_MOTOR_INDICES,
     IK_REPLAY_ROOT,
+    read_torso_state,
 )
 
 CONTROL_DT = 0.02          # 50Hz，官方示例节拍
@@ -36,20 +46,26 @@ LOWSTATE_TOPIC = "rt/lowstate"
 WEIGHT_MOTOR_INDEX = 31
 DEFAULT_KP = 80.0
 DEFAULT_KD = 1.5
+# 腕部电机小得多（URDF effort 10Nm vs 肩 130Nm），跟大关节同一档刚度会发抖
+DEFAULT_KP_WRIST = 50.0
+DEFAULT_KD_WRIST = 2.0
+PUSH_TAU_LIMIT = 20.0      # 主动出力（拨开关）的上限
+EFFORT_MARGIN = 0.6        # 前馈总量不超过 URDF 额定力矩的这个比例
+
+# 注意：曾试过经由 rt/arm_sdk 控制腰 yaw（12 号电机），真机验证固件直接
+# 忽略——H2 的 arm_sdk 混合通道只覆盖双臂 15~28 + 权重 31（官方例程同）。
+# 要转腰/对准柜面请走高层 loco 的 SetVelocity 原地转身，见 reach 的 /turn。
 
 
-def _load_joint_limits(arm: str) -> tuple[list[str], np.ndarray]:
-    """从 IK_replay 的 h2 URDF 读该手臂 7 关节的名字和限位。"""
+def _load_arm_model(arm: str):
+    """加载 IK_replay 的 h2 URDF 模型，返回 (model, chain_id)。"""
     if str(IK_REPLAY_ROOT) not in sys.path:
         sys.path.insert(0, str(IK_REPLAY_ROOT))
     from core.robot_config import load_robot_config
     from core.robot_model import RobotModel
 
     model = RobotModel(load_robot_config(IK_REPLAY_ROOT / "config" / "robots" / "h2.yaml"))
-    chain = f"{arm}_arm"
-    names = model.joint_names(chain)
-    lower, upper = model.joint_limits(chain)
-    return names, np.stack([lower, upper], axis=1)
+    return model, f"{arm}_arm"
 
 
 class H2ArmController:
@@ -58,6 +74,9 @@ class H2ArmController:
     def __init__(self, arm: str = "right", network_interface: str | None = None,
                  max_speed_rad_s: float = 0.2, hand_move_kd: float = 2.0,
                  kp: float = DEFAULT_KP, kd: float = DEFAULT_KD,
+                 kp_wrist: float | None = None, kd_wrist: float | None = None,
+                 grav_alpha: float = 1.0, payload_kg: float = 0.0,
+                 grav_in_float: bool = False, use_imu_gravity: bool = False,
                  lowstate_timeout: float = 5.0):
         from unitree_sdk2py.core.channel import ChannelPublisher, ChannelSubscriber
         from unitree_sdk2py.idl.default import unitree_hg_msg_dds__LowCmd_
@@ -65,13 +84,30 @@ class H2ArmController:
         from unitree_sdk2py.utils.crc import CRC
 
         self.arm = arm
-        self.joint_names, self.limits = _load_joint_limits(arm)
+        model, chain = _load_arm_model(arm)
+        self.joint_names = model.joint_names(chain)
+        lower, upper = model.joint_limits(chain)
+        self.limits = np.stack([lower, upper], axis=1)
         self.n = len(self.joint_names)
         self.max_speed = float(max_speed_rad_s)
         self._speed_ceiling = self.max_speed   # 启动参数是天花板，段级只能往下调
         self.hand_move_kd = float(hand_move_kd)
         self.kp = float(kp)
         self.kd = float(kd)
+        self.kp_wrist = float(kp_wrist if kp_wrist is not None else DEFAULT_KP_WRIST)
+        self.kd_wrist = float(kd_wrist if kd_wrist is not None else DEFAULT_KD_WRIST)
+        is_wrist = np.array(["wrist" in n for n in self.joint_names])
+        self.kp_vec = np.where(is_wrist, self.kp_wrist, self.kp)
+        self.kd_vec = np.where(is_wrist, self.kd_wrist, self.kd)
+
+        # ---- 重力前馈 ----
+        self.grav_alpha = float(np.clip(grav_alpha, 0.0, 1.2))
+        self.payload_kg = float(payload_kg)
+        self.grav_in_float = bool(grav_in_float)
+        self.use_imu_gravity = bool(use_imu_gravity)
+        self._grav_model = (ArmGravityModel(model, chain, payload_kg=self.payload_kg)
+                            if self.grav_alpha > 0 else None)
+        self._tau_cap = EFFORT_MARGIN * parse_effort_limits(model.urdf_path, self.joint_names)
 
         self._jog_indices = (H2_RIGHT_ARM_MOTOR_INDICES if arm == "right"
                              else H2_LEFT_ARM_MOTOR_INDICES)
@@ -104,8 +140,17 @@ class H2ArmController:
         q0 = self._clamp(self._read_motors(self._jog_indices))
         self._cmd_q = q0.copy()
         self._desired_q = q0.copy()
-        self._tau_ff = np.zeros(self.n)   # 前馈力矩（按压/拨动出力用）
+        self._tau_push = np.zeros(self.n)   # 主动出力（按压/拨动），外部设定
+        self._tau_grav = np.zeros(self.n)   # 重力前馈，每周期按指令角重算
         self._other_hold_q = self._read_motors(self._other_indices)
+        # 另一条手臂全程定姿保持，重力力矩是常数，开机算一次即可；
+        # 不给它前馈的话，接管瞬间它会比本体控制器托着时又往下掉几度
+        self._other_tau = np.zeros(self.n)
+        if self._grav_model is not None:
+            other_chain = "left_arm" if arm == "right" else "right_arm"
+            other_grav = ArmGravityModel(model, other_chain, payload_kg=self.payload_kg)
+            self._other_tau = np.clip(self.grav_alpha * other_grav.torque(self._other_hold_q),
+                                      -self._tau_cap, self._tau_cap)
         self._thread = threading.Thread(target=self._loop, name="h2-arm-jog", daemon=True)
 
     # ---- DDS 读 ----
@@ -123,6 +168,25 @@ class H2ArmController:
 
     def read_measured(self) -> np.ndarray:
         return self._read_motors(self._jog_indices)
+
+    def read_torso_state(self) -> dict | None:
+        """腰三关节 + IMU 姿态，用于"手臂到位了但躯干动了吗"的诊断。"""
+        with self._state_lock:
+            state = self._low_state
+        return read_torso_state(state) if state is not None else None
+
+    def _gravity_dir(self) -> np.ndarray | None:
+        """重力方向（根系）。默认按躯干直立处理；开了 IMU 修正才用实测姿态。"""
+        if not self.use_imu_gravity:
+            return None
+        with self._state_lock:
+            state = self._low_state
+        if state is None:
+            return None
+        try:
+            return gravity_dir_from_quaternion(state.imu_state.quaternion)
+        except Exception:
+            return None
 
     # ---- 生命周期 ----
 
@@ -146,26 +210,43 @@ class H2ArmController:
                        tau_ff: np.ndarray) -> None:
         cmd = self._low_cmd
         cmd.motor_cmd[WEIGHT_MOTOR_INDEX].q = float(weight)
-        for value, tau, idx in zip(jog_q, tau_ff, self._jog_indices):
+        for i, idx in enumerate(self._jog_indices):
             m = cmd.motor_cmd[idx]
-            m.tau = 0.0 if float_mode else float(tau)
-            m.q = float(value)
+            m.tau = float(tau_ff[i])
+            m.q = float(jog_q[i])
             m.dq = 0.0
-            if float_mode:
-                m.kp = 0.0
-                m.kd = self.hand_move_kd
-            else:
-                m.kp = self.kp
-                m.kd = self.kd
-        for value, idx in zip(self._other_hold_q, self._other_indices):
+            m.kp = 0.0 if float_mode else float(self.kp_vec[i])
+            m.kd = self.hand_move_kd if float_mode else float(self.kd_vec[i])
+        for i, idx in enumerate(self._other_indices):
             m = cmd.motor_cmd[idx]
-            m.tau = 0.0
-            m.q = float(value)
+            m.tau = float(self._other_tau[i] * weight)
+            m.q = float(self._other_hold_q[i])
             m.dq = 0.0
-            m.kp = self.kp
-            m.kd = self.kd
+            m.kp = float(self.kp_vec[i])
+            m.kd = float(self.kd_vec[i])
         cmd.crc = self._crc.Crc(cmd)
         self._publisher.Write(cmd)
+
+    def _compute_tau(self, cmd_q: np.ndarray, tau_push: np.ndarray,
+                     float_mode: bool, weight: float) -> np.ndarray:
+        """总前馈 = 重力托举 + 主动出力，再按电机额定力矩兜底钳位。
+
+        保持/点动模式下重力项按【指令角】算而不是实测角：实测角本身就含下垂，
+        拿它算前馈等于承认下垂，越补越低；指令角是我们想要它待的地方，托举
+        力矩就该按那里算。卸力模式下没有位置目标（kp=0），调用方会传入
+        【实测角】——托举的是手臂当前实际所在的姿态，人拖到哪补到哪。
+        权重渐入期间同步缩放，避免接管瞬间力矩阶跃。
+        """
+        tau_grav = np.zeros(self.n)
+        if self._grav_model is not None and (not float_mode or self.grav_in_float):
+            try:
+                tau_grav = self.grav_alpha * self._grav_model.torque(
+                    cmd_q, g_dir=self._gravity_dir())
+            except Exception:
+                tau_grav = np.zeros(self.n)
+        self._tau_grav = tau_grav
+        tau = tau_grav + (np.zeros(self.n) if float_mode else tau_push)
+        return np.clip(tau * float(weight), -self._tau_cap, self._tau_cap)
 
     def _loop(self) -> None:
         next_t = time.perf_counter()
@@ -188,7 +269,16 @@ class H2ArmController:
                         delta = delta * (step / worst)
                     self._cmd_q = self._cmd_q + delta
                 cmd_q = self._cmd_q.copy()
-                tau_ff = self._tau_ff.copy()
+                tau_push = self._tau_push.copy()
+            # 重力前馈用哪个角度算，两种模式不同（见 _compute_tau 注释）：
+            # 保持/点动 → 指令角（抗下垂）；卸力 → 实测角（cmd_q 冻结在入口
+            # 姿态，人一拖远前馈就全错，手臂会被错误力矩推得乱扭）
+            q_grav = cmd_q
+            if float_mode:
+                measured = self._safe_measured()
+                if measured is not None:
+                    q_grav = measured
+            tau_ff = self._compute_tau(q_grav, tau_push, float_mode, weight)
             try:
                 self._write_command(cmd_q, float_mode, weight, tau_ff)
             except Exception:
@@ -210,8 +300,28 @@ class H2ArmController:
         except Exception:
             return None
 
+    def describe_gravity(self) -> dict:
+        """启动时打印用：参与计算的连杆质量、当前姿态需要多少托举力矩。"""
+        if self._grav_model is None:
+            return {"enabled": False}
+        info = dict(self._grav_model.describe())
+        info["enabled"] = True
+        info["alpha"] = self.grav_alpha
+        try:
+            tau = self.grav_alpha * self._grav_model.torque(self.read_measured())
+            info["tau_now_nm"] = [round(float(v), 2) for v in tau]
+        except Exception:
+            pass
+        info["tau_cap_nm"] = [round(float(v), 1) for v in self._tau_cap]
+        return info
+
     def enter_hand_move(self) -> bool:
-        """卸力拖动（真机会下坠，必须有人扶住）。仅点动关闭时允许。"""
+        """卸力拖动，仅点动关闭时允许。
+
+        grav_in_float=False（默认）时手臂会下坠，必须有人扶住；
+        开了之后重力前馈在卸力态继续给，手臂近似"失重"，推到哪停哪，
+        录路点会轻松很多——代价是补过头时手臂会缓慢上飘，需要先验证 alpha。
+        """
         with self._lock:
             if self._jog_enabled:
                 return False
@@ -226,13 +336,13 @@ class H2ArmController:
             self._float = False
             self._desired_q = self._cmd_q.copy()
             self._jog_enabled = True
-            self._tau_ff[:] = 0.0
+            self._tau_push[:] = 0.0
 
     def disable_jog(self) -> None:
         with self._lock:
             self._desired_q = self._cmd_q.copy()
             self._jog_enabled = False
-            self._tau_ff[:] = 0.0
+            self._tau_push[:] = 0.0
 
     def stop(self) -> None:
         """冻结 + 刚性保持（也用于退出卸力模式）。"""
@@ -243,7 +353,7 @@ class H2ArmController:
             self._float = False
             self._desired_q = self._cmd_q.copy()
             self._jog_enabled = False
-            self._tau_ff[:] = 0.0
+            self._tau_push[:] = 0.0
 
     def set_max_speed(self, v: float) -> None:
         """段级速度档：普通段慢而稳，快拨段提速；不会超过启动参数的天花板。"""
@@ -251,8 +361,8 @@ class H2ArmController:
             self.max_speed = float(np.clip(v, 0.05, self._speed_ceiling))
 
     def set_tau_ff(self, tau) -> bool:
-        """设置前馈力矩（Nm/关节，任一关节超 ±20 时整体等比缩小，保持力方向）。
-        位置指令照常，出力叠加在其上；点动关闭、卸力、急停都会自动清零。
+        """设置主动出力（Nm/关节，任一关节超 ±20 时整体等比缩小，保持力方向）。
+        位置指令照常，出力叠加在重力前馈之上；点动关闭、卸力、急停都会自动清零。
         用于贴着表面按压/拨动时主动出力。"""
         with self._lock:
             if not self._jog_enabled:
@@ -263,9 +373,9 @@ class H2ArmController:
             if not np.all(np.isfinite(tau)):
                 raise ValueError("力矩包含非法值")
             worst = float(np.max(np.abs(tau)))
-            if worst > 20.0:
-                tau = tau * (20.0 / worst)
-            self._tau_ff = tau
+            if worst > PUSH_TAU_LIMIT:
+                tau = tau * (PUSH_TAU_LIMIT / worst)
+            self._tau_push = tau
             return True
 
     def set_target(self, q_desired) -> bool:
@@ -298,6 +408,7 @@ class H2ArmController:
             jog = self._jog_enabled
             floating = self._float
             weight = self._weight
+            push = self._tau_push.copy()
         try:
             measured = self.read_measured().tolist()
         except Exception:
@@ -314,4 +425,14 @@ class H2ArmController:
             "desired_rad": desired.tolist(),
             "limits_rad": self.limits.tolist(),
             "max_speed_rad_s": self.max_speed,
+            "kp": self.kp,
+            "kd": self.kd,
+            "kp_wrist": self.kp_wrist,
+            "kd_wrist": self.kd_wrist,
+            "grav_alpha": self.grav_alpha,
+            "payload_kg": self.payload_kg,
+            "grav_in_float": self.grav_in_float,
+            "use_imu_gravity": self.use_imu_gravity,
+            "tau_grav_nm": np.asarray(self._tau_grav).tolist(),
+            "tau_push_nm": push.tolist(),
         }

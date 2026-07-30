@@ -142,6 +142,27 @@ async function solve() {
   }
 }
 
+// 固定相机外参、只解 p_tool（点击指尖尖端的样本）
+const toolResult = ref(null)
+const toolBusy = ref(false)
+
+async function solveToolOnly() {
+  toolBusy.value = true
+  errorMsg.value = ''
+  try {
+    const res = await fetch('/api/solve_tool', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+    const data = await res.json()
+    if (data.ok) toolResult.value = data
+    else errorMsg.value = data.error || '解算失败'
+  } finally {
+    toolBusy.value = false
+  }
+}
+
 const matrixText = computed(() => {
   if (!result.value) return ''
   return result.value.T_cam2base
@@ -192,18 +213,114 @@ function nudgeJoint(index, sign) {
 }
 
 function handMove() {
-  if (!confirm('卸力后手臂会因重力下坠，请先扶住手臂！确认进入卸力模式？')) return
+  if (!confirm('卸力拖动：重力前馈会让手臂近似失重（推到哪停哪），但补偿有偏差时仍可能缓慢飘移，请用手护住手臂。确认进入？')) return
   armPost('hand_move')
+}
+
+function engageArm() {
+  if (!confirm('获取控制会立即发布 rt/arm_sdk 接管手臂（真机！），并在当前姿态刚性保持。\n请确认没有其他程序（遥操作 / reach_server 等）在控制手臂。')) return
+  armPost('engage')
+}
+
+function disarmArm() {
+  const extra = arm.value?.float ? '当前处于卸力模式，' : ''
+  if (!confirm(`${extra}归还控制后手臂交还本体控制器，权重 1 秒渐出——请扶住手臂。确认归还？`)) return
+  armPost('disarm')
 }
 
 function jointShortName(name) {
   return name.replace(/^(left|right)_/, '').replace(/_joint$/, '')
 }
 
+// ---- 指尖尖点标定（pivot：多姿态触同一固定点，只用 FK，不用相机） ----
+
+const pivotSamples = ref([])
+const pivotResult = ref(null)
+const pivotBusy = ref(false)
+
+async function refreshPivot() {
+  try {
+    const data = await (await fetch('/api/pivot/samples')).json()
+    pivotSamples.value = data.samples || []
+  } catch { /* 后端未起 */ }
+}
+
+async function pivotAdd() {
+  pivotBusy.value = true
+  errorMsg.value = ''
+  try {
+    const res = await fetch('/api/pivot/samples', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    })
+    const data = await res.json()
+    if (!data.ok) errorMsg.value = data.error || '采样失败'
+    else { pivotResult.value = null; await refreshPivot() }
+  } catch (e) {
+    errorMsg.value = String(e)
+  } finally {
+    pivotBusy.value = false
+  }
+}
+
+async function pivotDelete(index) {
+  await fetch(`/api/pivot/samples/${index}`, { method: 'DELETE' })
+  pivotResult.value = null
+  await refreshPivot()
+}
+
+async function pivotClear() {
+  if (!confirm('清空所有尖点样本？')) return
+  await fetch('/api/pivot/clear', { method: 'POST' })
+  pivotResult.value = null
+  await refreshPivot()
+}
+
+async function pivotSolve() {
+  pivotBusy.value = true
+  errorMsg.value = ''
+  try {
+    const res = await fetch('/api/pivot/solve', { method: 'POST' })
+    const data = await res.json()
+    if (data.ok) pivotResult.value = data
+    else errorMsg.value = data.error || '解算失败'
+  } finally {
+    pivotBusy.value = false
+  }
+}
+
+// 腕姿态摘要（rpy 度，URDF 固定轴约定），方便看 roll 是否转开了
+function wristRpyDeg(T) {
+  const R = T
+  const pitch = Math.atan2(-R[2][0], Math.hypot(R[0][0], R[1][0]))
+  let roll, yaw
+  if (Math.abs(Math.cos(pitch)) < 1e-8) {
+    roll = 0
+    yaw = Math.atan2(-R[0][1], R[1][1])
+  } else {
+    roll = Math.atan2(R[2][1], R[2][2])
+    yaw = Math.atan2(R[1][0], R[0][0])
+  }
+  return [roll, pitch, yaw].map((a) => (a * 180 / Math.PI).toFixed(0)).join('/')
+}
+
+// 卸力摆位时单手不方便点鼠标：按空格 = 「保持当前位置」
+function onKeyDown(ev) {
+  if (ev.code !== 'Space' || ev.repeat) return
+  const tag = ev.target?.tagName
+  if (tag === 'INPUT' || tag === 'TEXTAREA') return
+  if (!arm.value?.float || armBusy.value) return
+  ev.preventDefault()
+  armPost('stop')
+}
+
 onMounted(async () => {
+  window.addEventListener('keydown', onKeyDown)
   await refreshStatus()
   await refreshSamples()
   await refreshArm()
+  await refreshPivot()
   setInterval(refreshArm, 800)
 })
 </script>
@@ -239,8 +356,10 @@ onMounted(async () => {
         />
       </div>
       <div class="video-hint">
-        机械臂停稳后，点击画面中的标记点（指尖/手背贴纸中心）。后端做多帧中值滤波并反投影；
-        自动位姿源会在点击的同一时刻抓取手腕位姿。避免点物体边缘（深度飞点）。
+        机械臂停稳后，点击画面中的标记点（指尖/手背贴纸中心）。深度<b>只取你点中的那个像素</b>
+        （8 帧时域中值，无空间外扩），该像素测不到深度会直接报错而不是拿背景顶替——
+        指尖太黑/太细测不到时，贴一小块哑光贴纸最有效。
+        自动位姿源会在点击的同一时刻抓取手腕位姿。
         <b>手腕的朝向也要在各样本间充分变化</b>，否则指尖偏移解不出来。
       </div>
     </div>
@@ -250,50 +369,68 @@ onMounted(async () => {
       <!-- 手臂点动（--arm-control 时显示） -->
       <div v-if="arm?.enabled" class="card">
         <h2>
-          0. {{ arm.arm === 'right' ? '右' : '左' }}臂点动
-          <span class="badge" :class="arm.float ? 'bad' : (arm.jog_enabled ? 'good' : '')">
-            {{ arm.float ? '卸力中（扶住！）' : (arm.jog_enabled ? '点动开启' : '刚性保持') }}
+          0. {{ arm.armed && arm.arm ? (arm.arm === 'right' ? '右' : '左') + '臂点动' : '手臂控制' }}
+          <span class="badge" :class="!arm.armed ? '' : (arm.float ? 'bad' : (arm.jog_enabled ? 'good' : 'good'))">
+            {{ !arm.armed ? '未接管' : (arm.float ? '卸力中（扶住！）' : (arm.jog_enabled ? '点动开启' : '刚性保持')) }}
           </span>
         </h2>
-        <div class="field-row">
-          <label>模式</label>
-          <button v-if="!arm.jog_enabled && !arm.float" class="btn primary"
-                  :disabled="armBusy" @click="armPost('enable_jog')">开启点动</button>
-          <button v-if="arm.jog_enabled" class="btn"
-                  :disabled="armBusy" @click="armPost('disable_jog')">停止点动</button>
-          <button v-if="!arm.jog_enabled && !arm.float" class="btn warn"
-                  :disabled="armBusy" @click="handMove">卸力拖动</button>
-          <button v-if="arm.float" class="btn primary"
-                  :disabled="armBusy" @click="armPost('stop')">保持当前位置</button>
-        </div>
-        <div class="field-row">
-          <label>步长</label>
-          <span class="step-group">
-            <button v-for="s in stepOptions" :key="s" class="btn step-btn"
-                    :class="{ active: stepDeg === s }" @click="stepDeg = s">{{ s }}°</button>
-          </span>
-        </div>
-        <table class="jog-table">
-          <tbody>
-            <tr v-for="(name, i) in arm.joint_names" :key="name">
-              <td class="jog-name">{{ jointShortName(name) }}</td>
-              <td class="jog-val">
-                {{ arm.measured_rad ? (arm.measured_rad[i] * 180 / Math.PI).toFixed(1) : '?' }}°
-              </td>
-              <td>
-                <button class="btn jog-btn" :disabled="!arm.jog_enabled || armBusy"
-                        @click="nudgeJoint(i, -1)">−</button>
-                <button class="btn jog-btn" :disabled="!arm.jog_enabled || armBusy"
-                        @click="nudgeJoint(i, +1)">+</button>
-              </td>
-            </tr>
-          </tbody>
-        </table>
-        <div class="video-hint">
-          点动有限速（{{ arm.max_speed_rad_s }} rad/s）并钳制在关节限位内。
-          卸力模式下 kp=0 只留阻尼，手臂会下坠，务必有人扶住；
-          摆好位置后点「保持当前位置」即锁定。
-        </div>
+
+        <template v-if="!arm.armed">
+          <div class="field-row">
+            <label></label>
+            <button class="btn primary" :disabled="armBusy" @click="engageArm">获取控制（真机接管）</button>
+          </div>
+          <div class="video-hint">
+            未接管时本服务只读 rt/lowstate，不发布任何控制指令，可与其他控制程序并存。
+            点「获取控制」后开始发布 rt/arm_sdk 并在当前姿态刚性保持——
+            <b>确保没有其他程序在控制手臂</b>。
+          </div>
+        </template>
+
+        <template v-else>
+          <div class="field-row">
+            <label>模式</label>
+            <button v-if="!arm.jog_enabled && !arm.float" class="btn primary"
+                    :disabled="armBusy" @click="armPost('enable_jog')">开启点动</button>
+            <button v-if="arm.jog_enabled" class="btn"
+                    :disabled="armBusy" @click="armPost('disable_jog')">停止点动</button>
+            <button v-if="!arm.jog_enabled && !arm.float" class="btn warn"
+                    :disabled="armBusy" @click="handMove">卸力拖动</button>
+            <button v-if="arm.float" class="btn primary"
+                    :disabled="armBusy" @click="armPost('stop')">保持当前位置（空格）</button>
+            <button class="btn warn" :disabled="armBusy" @click="disarmArm">归还控制</button>
+          </div>
+          <div class="field-row">
+            <label>步长</label>
+            <span class="step-group">
+              <button v-for="s in stepOptions" :key="s" class="btn step-btn"
+                      :class="{ active: stepDeg === s }" @click="stepDeg = s">{{ s }}°</button>
+            </span>
+          </div>
+          <table class="jog-table">
+            <tbody>
+              <tr v-for="(name, i) in arm.joint_names" :key="name">
+                <td class="jog-name">{{ jointShortName(name) }}</td>
+                <td class="jog-val">
+                  {{ arm.measured_rad ? (arm.measured_rad[i] * 180 / Math.PI).toFixed(1) : '?' }}°
+                </td>
+                <td>
+                  <button class="btn jog-btn" :disabled="!arm.jog_enabled || armBusy"
+                          @click="nudgeJoint(i, -1)">−</button>
+                  <button class="btn jog-btn" :disabled="!arm.jog_enabled || armBusy"
+                          @click="nudgeJoint(i, +1)">+</button>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+          <div class="video-hint">
+            点动有限速（{{ arm.max_speed_rad_s }} rad/s）并钳制在关节限位内。
+            卸力模式下 kp=0 只留阻尼 + 重力前馈（按实测角实时算），手臂近似失重、
+            推到哪停哪；补偿有偏差时可能缓慢飘移，请护住手臂；
+            摆好位置后点「保持当前位置」或<b>按空格</b>即锁定（单手扶臂时方便）。
+            「归还控制」权重 1 秒渐出后交还本体控制器，请扶住手臂。
+          </div>
+        </template>
       </div>
 
       <!-- 当前样本 -->
@@ -385,6 +522,104 @@ onMounted(async () => {
           </div>
           <div class="result-box" style="margin-top: 10px;">{{ matrixText }}</div>
           <div class="video-hint">已保存到 {{ result.saved_to }}</div>
+        </template>
+
+        <div class="field-row" style="margin-top: 12px;">
+          <button class="btn" :disabled="samples.length < 3 || toolBusy" @click="solveToolOnly">
+            {{ toolBusy ? '解算中…' : '只解指尖偏移（固定相机外参）' }}
+          </button>
+        </div>
+        <div class="video-hint">
+          已有可信的相机外参时用这个：每次点击<b>指尖的尖端</b>采样（不同手腕姿态、
+          含反手大 roll），3 个样本起步、建议 ≥ 8。自动复用最新一份联合解算的
+          T_base←camera，只解 3 个未知量，比联合解稳。
+        </div>
+        <template v-if="toolResult">
+          <div style="margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap;">
+            <span class="badge" :class="toolResult.residual_mm.rms < 5 ? 'good' : 'bad'">
+              拟合 RMS {{ fmt(toolResult.residual_mm.rms, 2) }} mm
+              （最大 {{ fmt(toolResult.residual_mm.max, 1) }}）
+            </span>
+            <span class="badge">
+              p_tool(腕系) [{{ toolResult.p_tool_wrist_m.map((v) => fmt(v, 4)).join(', ') }}] m
+            </span>
+            <span class="badge">姿态跨度 {{ fmt(toolResult.wrist_rotation_spread_deg, 1) }}°</span>
+            <span v-if="toolResult.delta_vs_calib_norm_mm != null" class="badge"
+                  :class="toolResult.delta_vs_calib_norm_mm < 5 ? 'good' : 'bad'">
+              与原 p_tool 差 {{ fmt(toolResult.delta_vs_calib_norm_mm, 1) }} mm
+              [{{ toolResult.delta_vs_calib_mm.map((v) => fmt(v, 1)).join(', ') }}]
+            </span>
+            <span v-if="toolResult.dropped_samples?.length" class="badge bad">
+              已自动剔除 {{ toolResult.dropped_samples.map((d) => `#${d.index}（${Math.round(d.residual_mm)}mm）`).join('、') }}
+            </span>
+            <span class="badge">实际参与 {{ toolResult.sample_indices.length }} 个样本</span>
+          </div>
+          <div class="video-hint">
+            外参来自 {{ toolResult.calib_used }}；
+            已生成替换 p_tool 的完整标定文件 {{ toolResult.merged_calib }}，
+            可直接给 reach_server --calib 用（--tool-out-mm 记得给 0）。
+          </div>
+        </template>
+      </div>
+
+      <!-- 指尖尖点标定 -->
+      <div class="card">
+        <h2>4. 指尖尖点标定（多姿态触同一点，不用相机）</h2>
+        <div class="video-hint">
+          找一个固定的尖角参照物（桌角/螺丝尖）。用「卸力拖动」把<b>指尖顶在该点上</b>，
+          点「保持当前位置」锁定后再点下面「采样当前姿态」；然后换一个手腕姿态
+          （<b>务必包含反手大角度 roll</b>，就是拨开关那个姿态）重新顶到同一点，重复采样。
+          建议 ≥ 6 个、姿态越分散越准。解算只用手腕 FK，不依赖相机；
+          残差反映"各姿态下指尖没真正钉在同一点"的程度。
+        </div>
+        <div class="field-row" style="margin-top: 8px;">
+          <label></label>
+          <button class="btn primary" :disabled="pivotBusy" @click="pivotAdd">采样当前姿态</button>
+          <button class="btn primary" :disabled="pivotSamples.length < 4 || pivotBusy" @click="pivotSolve">
+            {{ pivotBusy ? '…' : `用 ${pivotSamples.length} 个姿态解算` }}
+          </button>
+          <button class="btn" :disabled="!pivotSamples.length" @click="pivotClear">清空</button>
+        </div>
+        <table v-if="pivotSamples.length">
+          <thead>
+            <tr><th>#</th><th>腕 t (m)</th><th>腕 rpy (°)</th><th></th></tr>
+          </thead>
+          <tbody>
+            <tr v-for="s in pivotSamples" :key="s.index">
+              <td>{{ s.index }}</td>
+              <td>{{ wristSummary(s.T_base_wrist) }}</td>
+              <td>{{ wristRpyDeg(s.T_base_wrist) }}</td>
+              <td><button class="del-btn" title="删除" @click="pivotDelete(s.index)">✕</button></td>
+            </tr>
+          </tbody>
+        </table>
+        <div v-else class="coord dim">还没有尖点样本</div>
+        <template v-if="pivotResult">
+          <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
+            <span class="badge" :class="pivotResult.residual_mm.rms < 5 ? 'good' : 'bad'">
+              拟合 RMS {{ fmt(pivotResult.residual_mm.rms, 2) }} mm
+            </span>
+            <span v-if="pivotResult.leave_one_out_stats_mm" class="badge"
+                  :class="pivotResult.leave_one_out_stats_mm.mean < 8 ? 'good' : 'bad'">
+              留一验证均值 {{ fmt(pivotResult.leave_one_out_stats_mm.mean, 2) }} mm
+            </span>
+            <span class="badge">
+              p_tool(腕系) [{{ pivotResult.p_tool_wrist_m.map((v) => fmt(v, 4)).join(', ') }}] m
+            </span>
+            <span class="badge">姿态跨度 {{ fmt(pivotResult.wrist_rotation_spread_deg, 1) }}°</span>
+            <span v-if="pivotResult.delta_vs_handeye_norm_mm != null" class="badge"
+                  :class="pivotResult.delta_vs_handeye_norm_mm < 5 ? 'good' : 'bad'">
+              与手眼标定 p_tool 差 {{ fmt(pivotResult.delta_vs_handeye_norm_mm, 1) }} mm
+              [{{ pivotResult.delta_vs_handeye_mm.map((v) => fmt(v, 1)).join(', ') }}]
+            </span>
+          </div>
+          <div class="video-hint">
+            已保存到 {{ pivotResult.saved_to }}
+            <template v-if="pivotResult.merged_calib">
+              ；同时生成了替换 p_tool 的完整标定文件 {{ pivotResult.merged_calib }}，
+              可直接给 reach_server 的 --calib 使用（注意 --tool-out-mm 是否还需要）。
+            </template>
+          </div>
         </template>
       </div>
     </div>
