@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 一键启动 hand_eye_3D 前后端。
 #
-#   ./start.sh              # 默认：H2 真机 + Orbbec 相机 + 手臂控制可用（网页点「获取控制」后才接管真机）
+#   ./start.sh              # 默认：H2 真机 + ZMQ RGB-D + 手臂控制可用（网页点「获取控制」后才接管真机）
 #   ./start.sh --no-arm     # 不启用手臂控制（只读 rt/lowstate，绝不发布，可与其他控制程序并存）
 #   ./start.sh <其他参数>    # 其余参数原样传给 run_server.py（如 --arm-grav-in-float）
 #
@@ -10,19 +10,28 @@ set -u
 
 cd "$(dirname "$0")"
 
-PY=~/miniconda3/envs/fastapi/bin/python   # fastapi 环境齐全：pyorbbecsdk + unitree_sdk2py
-SERIAL=CP0BB53000FS
+PY=~/miniconda3/envs/fastapi/bin/python   # fastapi 环境包含 pyzmq + unitree_sdk2py
 IFACE=enp86s0
+CAMERA_HOST="${CAMERA_HOST:-127.0.0.1}"
+RGBD_CALIB="${RGBD_CALIB:-/home/robot/yx/project/IK_replay/config/camera/orbbec_rgbd_calibration.json}"
 
 ARM_ARGS=(--arm-control)
 EXTRA=()
+OFFLINE=0
 for a in "$@"; do
   if [ "$a" = "--no-arm" ]; then
     ARM_ARGS=()
   else
     EXTRA+=("$a")
+    case "$a" in
+      --teleop-task-dir|--teleop-task-dir=*) OFFLINE=1 ;;
+    esac
   fi
 done
+if [ "$OFFLINE" -eq 1 ]; then
+  ARM_ARGS=()
+  echo "离线遥操作数据模式：不打开相机、不连接或控制机器人。"
+fi
 
 if [ ${#ARM_ARGS[@]} -gt 0 ]; then
   echo "手臂控制可用：网页里点「获取控制」后才发布 rt/arm_sdk（获取前请确认没有其他控制程序）。"
@@ -42,7 +51,7 @@ cleanup() {
 trap cleanup INT TERM
 
 "$PY" run_server.py \
-  --camera-source orbbec --camera-serial "$SERIAL" \
+  --camera-source zmq --camera-host "$CAMERA_HOST" --rgbd-calib "$RGBD_CALIB" \
   --pose-source h2 --network-interface "$IFACE" \
   "${ARM_ARGS[@]}" "${EXTRA[@]}" &
 BACK_PID=$!

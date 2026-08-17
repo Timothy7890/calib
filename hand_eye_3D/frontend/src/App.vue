@@ -1,5 +1,6 @@
 <script setup>
 import { computed, onMounted, ref } from 'vue'
+import MarkerOverlay from './components/MarkerOverlay.vue'
 
 const status = ref(null)
 const samples = ref([])
@@ -14,6 +15,203 @@ const wristManual = ref({ x: '', y: '', z: '', roll: '', pitch: '', yaw: '' })
 const clickPos = ref(null)
 
 const imgEl = ref(null)
+const offlineEpisodes = ref([])
+const selectedEpisode = ref('')
+const episodesBusy = ref(false)
+const previewVersion = ref(0)
+const showDepthOverlay = ref(false)
+const depthOverlayOpacity = ref(45)
+const markerColors = ref([])
+const detectedMarkers = ref([])
+const markerImageSize = ref(null)
+const markerWarnings = ref([])
+const missingColors = ref([])
+const markerBusy = ref(false)
+const markerConfirmBusy = ref(false)
+const confirmElapsedSec = ref(0)
+const markerBatchBusy = ref(false)
+const selectedMarkerKey = ref(null)
+const addMarkerColorId = ref('')
+const markerConfirmation = ref(null)
+const markerBatchSaved = ref(false)
+const imageNaturalSize = ref(null)
+let markerKeyCounter = 0
+let detectionRequestId = 0
+
+const offlineMode = computed(() => status.value?.mode === 'offline')
+const selectedEpisodeInfo = computed(() =>
+  offlineEpisodes.value.find((episode) => episode.name === selectedEpisode.value) || null,
+)
+const imageSrc = computed(() => {
+  // status 还没回来时绝不能去拉 /api/stream，否则离线页会误开 MJPEG 把 Vite 代理堵死。
+  if (!status.value) return ''
+  if (!offlineMode.value) return '/api/stream'
+  if (!selectedEpisode.value) return ''
+  return `/api/offline/episodes/${encodeURIComponent(selectedEpisode.value)}/preview?v=${previewVersion.value}`
+})
+const depthOverlaySrc = computed(() => {
+  if (!offlineMode.value || !selectedEpisode.value) return ''
+  return `/api/offline/episodes/${encodeURIComponent(selectedEpisode.value)}/depth-overlay?v=${previewVersion.value}`
+})
+const overlayImageSize = computed(() => markerImageSize.value || imageNaturalSize.value)
+
+function markerColorId(marker) {
+  const byColor = markerColors.value.find(
+    (color) => String(color.id) === String(marker.color),
+  )
+  if (byColor) return byColor.id
+  const byId = markerColors.value.find((color) => String(color.id) === String(marker.id))
+  return byId?.id ?? marker.color ?? marker.id
+}
+
+function episodeNameOfSample(sample) {
+  return sample.episode || sample.pose_id || sample.provenance?.episode
+}
+
+function samplesForEpisode(name) {
+  return samples.value.filter((sample) => episodeNameOfSample(sample) === name)
+}
+
+function isSavedMarker(marker) {
+  return marker.source === 'saved'
+    || (Array.isArray(marker.flags) && marker.flags.includes('already_saved'))
+}
+
+function sampleToMarker(sample) {
+  const center = sample.center || sample.pixel || [0, 0]
+  return normalizeMarker({
+    id: sample.marker_id || sample.id,
+    color: sample.color,
+    center: [Number(center[0]), Number(center[1])],
+    radius_px: Number(sample.radius_px) || 12,
+    source: 'saved',
+    confidence: 1,
+    color_confidence: 1,
+    circularity: 1,
+    flags: ['already_saved'],
+    saved_index: sample.index,
+  })
+}
+
+function mergeDetectedWithSaved(episode, detected) {
+  const saved = samplesForEpisode(episode).map(sampleToMarker)
+  const savedColors = new Set(saved.map((marker) => String(markerColorId(marker))))
+  const extras = detected.filter((marker) => !savedColors.has(String(markerColorId(marker))))
+  return [...saved, ...extras]
+}
+
+const duplicateColorIds = computed(() => {
+  const counts = new Map()
+  for (const marker of detectedMarkers.value) {
+    const id = String(markerColorId(marker))
+    counts.set(id, (counts.get(id) || 0) + 1)
+  }
+  return [...counts.entries()].filter(([, count]) => count > 1).map(([id]) => id)
+})
+const confirmedObservations = computed(() => markerConfirmation.value?.observations || [])
+const unsavedMarkers = computed(() => detectedMarkers.value.filter((marker) => !isSavedMarker(marker)))
+const savedOverlayMarkers = computed(() => detectedMarkers.value.filter(isSavedMarker))
+const markerConfirmSucceeded = computed(() =>
+  markerConfirmation.value?.ok
+  && !(markerConfirmation.value.errors || []).length
+  && confirmedObservations.value.length === unsavedMarkers.value.length
+  && unsavedMarkers.value.length > 0,
+)
+const canConfirmMarkers = computed(() =>
+  unsavedMarkers.value.length > 0
+  && !duplicateColorIds.value.length
+  && !markerBusy.value
+  && !markerConfirmBusy.value,
+)
+
+function colorLabel(id) {
+  return markerColors.value.find((color) => String(color.id) === String(id))?.label || id || '—'
+}
+
+function resetMarkerWorkflow() {
+  detectedMarkers.value = []
+  markerImageSize.value = null
+  markerWarnings.value = []
+  missingColors.value = []
+  selectedMarkerKey.value = null
+  addMarkerColorId.value = ''
+  markerConfirmation.value = null
+  markerBatchSaved.value = false
+}
+
+function invalidateMarkerConfirmation() {
+  markerConfirmation.value = null
+  markerBatchSaved.value = false
+}
+
+function normalizeMarker(marker) {
+  return {
+    ...marker,
+    center: [...marker.center],
+    flags: Array.isArray(marker.flags) ? [...marker.flags] : marker.flags,
+    _key: `marker-${++markerKeyCounter}`,
+  }
+}
+
+function markerPayload(marker) {
+  const { _key, ...payload } = marker
+  return {
+    ...payload,
+    center: payload.center.map(Number),
+    radius_px: Number(payload.radius_px),
+  }
+}
+
+async function loadMarkerColors() {
+  try {
+    const res = await fetch('/api/markers/colors')
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || '颜色配置加载失败')
+    markerColors.value = (data.colors || []).map((color) => ({
+      ...color,
+      id: color.id ?? color.color,
+      label: color.label ?? color.label_zh ?? color.color ?? color.id,
+    }))
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  }
+}
+
+async function detectMarkers(episode = selectedEpisode.value) {
+  if (!offlineMode.value || !episode) return
+  const requestId = ++detectionRequestId
+  markerBusy.value = true
+  errorMsg.value = ''
+  resetMarkerWorkflow()
+  try {
+    await refreshSamples()
+    const res = await fetch('/api/offline/detect-markers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ episode }),
+    })
+    const data = await res.json()
+    if (requestId !== detectionRequestId || episode !== selectedEpisode.value) return
+    if (!res.ok || !data.ok) throw new Error(data.error || '自动检测失败')
+    const detected = (data.markers || data.candidates || []).map(normalizeMarker)
+    detectedMarkers.value = mergeDetectedWithSaved(episode, detected)
+    markerImageSize.value = data.image_size || null
+    markerWarnings.value = data.warnings || []
+    const savedColors = new Set(
+      samplesForEpisode(episode).map((sample) => String(sample.color)),
+    )
+    missingColors.value = (data.missing_colors || []).filter(
+      (color) => !savedColors.has(String(color)),
+    )
+    selectedMarkerKey.value = detectedMarkers.value[0]?._key || null
+  } catch (e) {
+    if (requestId === detectionRequestId) {
+      errorMsg.value = e instanceof Error ? e.message : String(e)
+    }
+  } finally {
+    if (requestId === detectionRequestId) markerBusy.value = false
+  }
+}
 
 async function refreshStatus() {
   status.value = await (await fetch('/api/status')).json()
@@ -24,17 +222,245 @@ async function refreshSamples() {
   samples.value = data.samples
 }
 
+async function refreshOfflineEpisodes() {
+  if (!offlineMode.value) {
+    offlineEpisodes.value = []
+    selectedEpisode.value = ''
+    resetMarkerWorkflow()
+    return
+  }
+  episodesBusy.value = true
+  try {
+    const res = await fetch('/api/offline/episodes')
+    const data = await res.json()
+    if (!res.ok) throw new Error(data.error || '离线剧集加载失败')
+    offlineEpisodes.value = data.episodes || []
+    let selectionChanged = false
+    if (!offlineEpisodes.value.some((episode) => episode.name === selectedEpisode.value)) {
+      selectedEpisode.value = offlineEpisodes.value[0]?.name || ''
+      selectionChanged = true
+      imageNaturalSize.value = null
+      pick.value = null
+      wristT.value = null
+      clickPos.value = null
+    }
+    if (selectionChanged && selectedEpisode.value) await detectMarkers(selectedEpisode.value)
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    episodesBusy.value = false
+  }
+}
+
+async function selectEpisode(episode) {
+  if (markerBusy.value || episode.name === selectedEpisode.value) return
+  selectedEpisode.value = episode.name
+  imageNaturalSize.value = null
+  pick.value = null
+  wristT.value = null
+  clickPos.value = null
+  previewVersion.value += 1
+  await detectMarkers(episode.name)
+}
+
+function episodeImportedCount(episode) {
+  return episode.imported_marker_count ?? episode.imported_marker_ids?.length ?? 0
+}
+
+function episodeSampleCount(episode) {
+  if (episode.sample_count != null) return episode.sample_count
+  if (episode.observation_count != null) return episode.observation_count
+  return samples.value.filter((sample) =>
+    (sample.episode || sample.provenance?.episode) === episode.name,
+  ).length
+}
+
+function onOfflineCanvasClick(center) {
+  if (markerBusy.value) return
+  if (!addMarkerColorId.value) {
+    selectedMarkerKey.value = null
+    return
+  }
+  const color = markerColors.value.find(
+    (option) => String(option.id) === String(addMarkerColorId.value),
+  )
+  if (!color) return
+  const radii = detectedMarkers.value
+    .map((marker) => Number(marker.radius_px))
+    .filter((radius) => Number.isFinite(radius) && radius > 0)
+    .sort((a, b) => a - b)
+  const radius = radii.length ? radii[Math.floor(radii.length / 2)] : 12
+  const marker = normalizeMarker({
+    id: `manual-${String(color.id)}-${markerKeyCounter + 1}`,
+    color: color.id,
+    center,
+    radius_px: radius,
+    confidence: 1,
+    color_confidence: 1,
+    circularity: 1,
+    source: 'manual',
+    flags: ['manual_added'],
+  })
+  detectedMarkers.value.push(marker)
+  selectedMarkerKey.value = marker._key
+  addMarkerColorId.value = ''
+  invalidateMarkerConfirmation()
+}
+
+function moveMarker({ key, center }) {
+  const marker = detectedMarkers.value.find((item) => item._key === key)
+  if (!marker) return
+  marker.center = center
+  invalidateMarkerConfirmation()
+}
+
+function changeMarkerColor(marker, colorId) {
+  if (isSavedMarker(marker)) return
+  const color = markerColors.value.find((option) => String(option.id) === String(colorId))
+  if (!color) return
+  marker.color = color.id
+  invalidateMarkerConfirmation()
+}
+
+function deleteMarker(marker) {
+  detectedMarkers.value = detectedMarkers.value.filter((item) => item._key !== marker._key)
+  if (selectedMarkerKey.value === marker._key) selectedMarkerKey.value = null
+  invalidateMarkerConfirmation()
+}
+
+function confirmationForMarker(marker, index) {
+  const sameMarker = (entry) => {
+    if (!entry || typeof entry !== 'object') return false
+    if (entry.marker_index === index || entry.index === index) return true
+    const ids = [entry.marker_id, entry.id, entry.marker_color, entry.color]
+      .filter((value) => value != null)
+      .map(String)
+    return ids.includes(String(marker.id)) || ids.includes(String(marker.color))
+  }
+  const observation = confirmedObservations.value.find(sameMarker)
+  const error = (markerConfirmation.value?.errors || []).find(sameMarker)
+  return { observation, error }
+}
+
+function markerErrorText(error) {
+  if (!error) return ''
+  if (typeof error === 'string') return error
+  return error.error || error.message || error.reason || '深度失败'
+}
+
+async function confirmMarkers() {
+  if (!canConfirmMarkers.value) return
+  markerConfirmBusy.value = true
+  confirmElapsedSec.value = 0
+  markerConfirmation.value = null
+  markerBatchSaved.value = false
+  errorMsg.value = ''
+  const started = Date.now()
+  const abort = new AbortController()
+  const tick = setInterval(() => {
+    confirmElapsedSec.value = Math.round((Date.now() - started) / 1000)
+  }, 200)
+  const timeout = setTimeout(() => abort.abort(), 20000)
+  try {
+    const res = await fetch('/api/offline/confirm-markers', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal: abort.signal,
+      body: JSON.stringify({
+        episode: selectedEpisode.value,
+        markers: unsavedMarkers.value.map(markerPayload),
+      }),
+    })
+    const data = await res.json()
+    markerConfirmation.value = data
+    if (!res.ok || !data.ok) throw new Error(data.error || '标记确认失败')
+    if ((data.errors || []).length) errorMsg.value = '部分标记深度失败，请调整后重新确认'
+  } catch (e) {
+    if (e instanceof DOMException && e.name === 'AbortError') {
+      errorMsg.value = '确认超时：页面到后端的连接被堵住了。请强制刷新后再点一次。'
+    } else {
+      errorMsg.value = e instanceof Error ? e.message : String(e)
+    }
+  } finally {
+    clearInterval(tick)
+    clearTimeout(timeout)
+    markerConfirmBusy.value = false
+  }
+}
+
+async function saveMarkerBatch() {
+  if (!markerConfirmSucceeded.value || markerBatchBusy.value) return
+  markerBatchBusy.value = true
+  errorMsg.value = ''
+  try {
+    const res = await fetch('/api/samples/batch', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        episode: selectedEpisode.value,
+        observations: confirmedObservations.value,
+      }),
+    })
+    const data = await res.json()
+    if (!res.ok || !data.ok) throw new Error(data.error || '批量保存失败')
+    markerBatchSaved.value = true
+    result.value = null
+    await refreshSamples()
+    await refreshOfflineEpisodes()
+    if (selectedEpisode.value) {
+      detectedMarkers.value = mergeDetectedWithSaved(selectedEpisode.value, [])
+      selectedMarkerKey.value = detectedMarkers.value[0]?._key || null
+    }
+  } catch (e) {
+    errorMsg.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    markerBatchBusy.value = false
+  }
+}
+
 // ---- 视频点击 → 反投影 ----
+
+function onImageLoad(event) {
+  const image = event.currentTarget
+  if (image.naturalWidth && image.naturalHeight) {
+    imageNaturalSize.value = [image.naturalWidth, image.naturalHeight]
+  }
+}
+
+function imagePixelFromEvent(ev, img) {
+  const rect = img.getBoundingClientRect()
+  const width = img.naturalWidth || status.value?.camera?.width
+  const height = img.naturalHeight || status.value?.camera?.height
+  if (!width || !height || !rect.width || !rect.height) return null
+
+  // 兼容固定尺寸容器中的 object-fit: contain，排除黑边并按原图尺寸映射。
+  const scale = Math.min(rect.width / width, rect.height / height)
+  const renderedWidth = width * scale
+  const renderedHeight = height * scale
+  const offsetX = (rect.width - renderedWidth) / 2
+  const offsetY = (rect.height - renderedHeight) / 2
+  const x = ev.clientX - rect.left - offsetX
+  const y = ev.clientY - rect.top - offsetY
+  if (x < 0 || y < 0 || x >= renderedWidth || y >= renderedHeight) return null
+
+  return {
+    u: Math.min(width - 1, Math.max(0, Math.floor(x / renderedWidth * width))),
+    v: Math.min(height - 1, Math.max(0, Math.floor(y / renderedHeight * height))),
+    xPct: (ev.clientX - rect.left) / rect.width * 100,
+    yPct: (ev.clientY - rect.top) / rect.height * 100,
+  }
+}
 
 async function onVideoClick(ev) {
   const img = imgEl.value
-  if (!img || !status.value?.camera?.width) return
-  const rect = img.getBoundingClientRect()
-  const relX = (ev.clientX - rect.left) / rect.width
-  const relY = (ev.clientY - rect.top) / rect.height
-  const u = Math.round(relX * status.value.camera.width)
-  const v = Math.round(relY * status.value.camera.height)
-  clickPos.value = { xPct: relX * 100, yPct: relY * 100 }
+  if (!img || offlineMode.value || pickBusy.value) return
+  const point = imagePixelFromEvent(ev, img)
+  if (!point) {
+    errorMsg.value = '请点击图像内容区域（不要点击留白）'
+    return
+  }
+  const { u, v, xPct, yPct } = point
+  clickPos.value = { xPct, yPct }
 
   pickBusy.value = true
   errorMsg.value = ''
@@ -83,8 +509,10 @@ const manualValid = computed(() =>
   Object.values(wristManual.value).every((s) => s !== '' && isFinite(Number(s))),
 )
 
-const wristReady = computed(() => (autoPose.value ? !!wristT.value : manualValid.value))
-const canSave = computed(() => pick.value && wristReady.value)
+const wristReady = computed(() =>
+  autoPose.value ? !!wristT.value : manualValid.value,
+)
+const canSave = computed(() => !offlineMode.value && pick.value && wristReady.value)
 
 // ---- 保存样本 ----
 
@@ -92,11 +520,25 @@ async function saveSample() {
   if (!canSave.value) return
   errorMsg.value = ''
   const body = { p_camera: pick.value.p_camera, pixel: pick.value.pixel }
-  if (autoPose.value && wristT.value) {
+  if ((offlineMode.value || autoPose.value) && wristT.value) {
     body.T_base_wrist = wristT.value
   } else {
     body.wrist_xyz = [Number(wristManual.value.x), Number(wristManual.value.y), Number(wristManual.value.z)]
     body.wrist_rpy = [Number(wristManual.value.roll), Number(wristManual.value.pitch), Number(wristManual.value.yaw)]
+  }
+  if (offlineMode.value) {
+    const episode = pick.value.episode || selectedEpisode.value
+    body.episode = episode
+    body.provenance = pick.value.provenance || {
+      mode: 'offline',
+      episode,
+      teleop_task_dir: status.value?.teleop_task_dir,
+      camera_serial: pick.value.camera_serial || selectedEpisodeInfo.value?.camera_serial,
+      preview_frame_idx: selectedEpisodeInfo.value?.preview_frame_idx,
+      burst_frames_used: pick.value.burst_frames_used,
+      qpos_median_rad: pick.value.qpos_median_rad,
+      depth_mm: pick.value.depth_mm,
+    }
   }
   const res = await fetch('/api/samples', {
     method: 'POST',
@@ -113,12 +555,14 @@ async function saveSample() {
   wristT.value = null
   result.value = null
   await refreshSamples()
+  await refreshOfflineEpisodes()
 }
 
 async function deleteSample(index) {
   await fetch(`/api/samples/${index}`, { method: 'DELETE' })
   result.value = null
   await refreshSamples()
+  await refreshOfflineEpisodes()
 }
 
 // ---- 解算 ----
@@ -164,15 +608,42 @@ async function solveToolOnly() {
 }
 
 const matrixText = computed(() => {
-  if (!result.value) return ''
+  if (!result.value?.T_cam2base) return ''
   return result.value.T_cam2base
     .map((r) => r.map((v) => v.toFixed(5).padStart(9)).join('  '))
     .join('\n')
+})
+const isMultiResult = computed(() =>
+  ['multi_tool_offset_joint', 'multi_marker_tool_offset_joint'].includes(result.value?.mode),
+)
+const multiMarkerRows = computed(() => {
+  if (!isMultiResult.value) return []
+  const offsets = result.value.p_tool_wrist_m_by_marker || {}
+  const residuals = result.value.residual_mm?.per_marker
+    || result.value.per_marker_residual_stats_mm
+    || result.value.residual_by_marker_mm
+    || {}
+  const ids = new Set([...Object.keys(offsets), ...Object.keys(residuals)])
+  return [...ids].map((id) => {
+    const offsetValue = offsets[id]
+    const residualValue = residuals[id]
+    const offset = Array.isArray(offsetValue)
+      ? offsetValue
+      : offsetValue?.p_tool_wrist_m || offsetValue?.offset_m || []
+    const residual = typeof residualValue === 'number'
+      ? { rms: residualValue }
+      : residualValue || {}
+    return { id, offset, residual }
+  })
 })
 
 function fmt(v, d = 4) { return Number(v).toFixed(d) }
 function wristSummary(T) {
   return `[${T[0][3].toFixed(3)}, ${T[1][3].toFixed(3)}, ${T[2][3].toFixed(3)}]`
+}
+function sampleMarkerLabel(sample) {
+  const id = sample.marker_color ?? sample.color ?? sample.marker_id
+  return id != null ? colorLabel(id) : '—'
 }
 
 // ---- 手臂点动（--arm-control 时后端才有） ----
@@ -318,10 +789,14 @@ function onKeyDown(ev) {
 onMounted(async () => {
   window.addEventListener('keydown', onKeyDown)
   await refreshStatus()
+  if (offlineMode.value) await loadMarkerColors()
   await refreshSamples()
+  await refreshOfflineEpisodes()
   await refreshArm()
   await refreshPivot()
-  setInterval(refreshArm, 800)
+  setInterval(() => {
+    if (!offlineMode.value) refreshArm()
+  }, 800)
 })
 </script>
 
@@ -332,13 +807,17 @@ onMounted(async () => {
       眼在手外 · 联合估计指尖偏移 · 输出 T_{{ status?.base_link || 'base' }}←camera（彩色相机系）
     </span>
     <div class="spacer" />
-    <span v-if="status" class="badge">
-      相机: {{ status.camera.name || status.camera.source }} {{ status.camera.serial }}
+    <span v-if="offlineMode" class="badge good">离线遥操作剧集</span>
+    <span v-if="offlineMode && status?.teleop_task_dir" class="badge">
+      数据目录: {{ status.teleop_task_dir }}
     </span>
-    <span v-if="status?.camera?.width" class="badge">
+    <span v-if="status && !offlineMode" class="badge">
+      相机: {{ status.camera?.name || status.camera?.source }} {{ status.camera?.serial }}
+    </span>
+    <span v-if="!offlineMode && status?.camera?.width" class="badge">
       分辨率: {{ status.camera.width }}×{{ status.camera.height }}
     </span>
-    <span v-if="status" class="badge">
+    <span v-if="status && !offlineMode" class="badge">
       位姿源: {{ status.pose_source }} ({{ status.wrist_link }})
     </span>
     <span v-if="status" class="badge">样本: {{ samples.length }}</span>
@@ -347,15 +826,107 @@ onMounted(async () => {
   <div class="layout">
     <!-- 左：视频 -->
     <div class="video-panel">
+      <div v-if="offlineMode" class="card offline-panel">
+        <h2>
+          离线剧集（{{ offlineEpisodes.length }}）
+          <button class="btn refresh-btn" :disabled="episodesBusy" @click="refreshOfflineEpisodes">
+            {{ episodesBusy ? '刷新中…' : '刷新' }}
+          </button>
+        </h2>
+        <div v-if="offlineEpisodes.length" class="episode-list">
+          <button
+            v-for="episode in offlineEpisodes"
+            :key="episode.name"
+            class="episode-item"
+            :class="{ selected: episode.name === selectedEpisode }"
+            :disabled="markerBusy"
+            @click="selectEpisode(episode)"
+          >
+            <span class="episode-main">
+              <b>{{ episode.name }}</b>
+              <span
+                class="badge"
+                :class="{ good: episodeImportedCount(episode) >= 9, bad: episodeImportedCount(episode) > 0 && episodeImportedCount(episode) < 9 }"
+              >
+                已保存 {{ episodeImportedCount(episode) }} 色
+              </span>
+            </span>
+            <span class="episode-meta">
+              {{ episode.frame_count }} 帧 · 预览 #{{ episode.preview_frame_idx }}
+              · 样本 {{ episodeSampleCount(episode) }}
+              <template v-if="episode.camera_serial"> · 相机 {{ episode.camera_serial }}</template>
+            </span>
+          </button>
+        </div>
+        <div v-else-if="!episodesBusy" class="coord dim">没有可用的离线剧集</div>
+      </div>
+
+      <div v-if="offlineMode" class="depth-controls">
+        <label class="depth-toggle">
+          <input v-model="showDepthOverlay" type="checkbox" />
+          叠加五帧中值深度
+        </label>
+        <input
+          v-model.number="depthOverlayOpacity"
+          class="depth-opacity"
+          type="range"
+          min="10"
+          max="90"
+          step="5"
+          :disabled="!showDepthOverlay"
+        />
+        <span class="coord dim">{{ depthOverlayOpacity }}%</span>
+        <span class="depth-legend">近 <i></i> 远</span>
+      </div>
+
       <div class="video-wrap">
-        <img ref="imgEl" :src="'/api/stream'" @click="onVideoClick" />
+        <img
+          v-if="imageSrc"
+          ref="imgEl"
+          class="clickable-image"
+          :src="imageSrc"
+          :width="overlayImageSize?.[0] || undefined"
+          :height="overlayImageSize?.[1] || undefined"
+          :alt="offlineMode ? `${selectedEpisode} 代表帧` : '实时相机画面'"
+          @load="onImageLoad"
+          @error="errorMsg = '预览图加载失败，请强制刷新页面'"
+          @click="onVideoClick"
+        />
+        <img
+          v-if="showDepthOverlay && depthOverlaySrc"
+          class="depth-overlay"
+          :src="depthOverlaySrc"
+          :style="{ opacity: depthOverlayOpacity / 100 }"
+          alt="五帧中值深度伪彩叠加"
+          @error="errorMsg = '深度叠加加载失败，请检查后端是否已重启'"
+        />
+        <MarkerOverlay
+          v-if="offlineMode && overlayImageSize"
+          :image-size="overlayImageSize"
+          :markers="detectedMarkers"
+          :colors="markerColors"
+          :selected-key="selectedMarkerKey"
+          :adding="!!addMarkerColorId"
+          :disabled="markerBusy || markerConfirmBusy"
+          @canvas-click="onOfflineCanvasClick"
+          @select="selectedMarkerKey = $event"
+          @move="moveMarker"
+        />
         <div
-          v-if="clickPos"
+          v-if="!offlineMode && clickPos"
           class="crosshair"
           :style="{ left: clickPos.xPct + '%', top: clickPos.yPct + '%' }"
         />
+        <div v-if="offlineMode && markerBusy" class="image-loading">正在检测九色标记…</div>
+        <div v-else-if="offlineMode && markerConfirmBusy" class="image-loading">
+          确认中… {{ confirmElapsedSec }}s
+        </div>
       </div>
-      <div class="video-hint">
+      <div v-if="offlineMode" class="video-hint">
+        每个姿态只确认当前手心或手背实际可见的颜色，不要求凑齐九色。拖动圆心可修正位置；
+        先选“添加颜色”再点图像可补标。黄色虚线表示低置信度或有歧义，请逐一检查。
+      </div>
+      <div v-else class="video-hint">
         机械臂停稳后，点击画面中的标记点（指尖/手背贴纸中心）。深度<b>只取你点中的那个像素</b>
         （8 帧时域中值，无空间外扩），该像素测不到深度会直接报错而不是拿背景顶替——
         指尖太黑/太细测不到时，贴一小块哑光贴纸最有效。
@@ -435,45 +1006,170 @@ onMounted(async () => {
 
       <!-- 当前样本 -->
       <div class="card">
-        <h2>1. 当前样本</h2>
-        <div class="field-row">
-          <label>P_camera</label>
-          <span v-if="pickBusy" class="coord dim">取点中…</span>
-          <span v-else-if="pick" class="coord ok">
-            [{{ fmt(pick.p_camera[0]) }}, {{ fmt(pick.p_camera[1]) }}, {{ fmt(pick.p_camera[2]) }}] m
-            · 深度 {{ Math.round(pick.depth_mm) }}mm
-          </span>
-          <span v-else class="coord dim">← 在左侧画面上点击标记点</span>
-        </div>
-
-        <template v-if="autoPose">
-          <div class="field-row">
-            <label>手腕位姿</label>
-            <span v-if="wristT" class="coord ok">t = {{ wristSummary(wristT) }} m（自动）</span>
-            <span v-else class="coord dim">点击取点时自动抓取</span>
-            <button class="btn" @click="readWristPose">重读</button>
+        <template v-if="offlineMode">
+          <h2>1. 九色标记确认</h2>
+          <div class="marker-toolbar">
+            <button
+              class="btn"
+              :disabled="markerBusy || markerConfirmBusy || !selectedEpisode"
+              @click="detectMarkers()"
+            >
+              {{ markerBusy ? '检测中…' : '重跑自动检测' }}
+            </button>
+            <select v-model="addMarkerColorId" class="marker-select" :disabled="markerBusy">
+              <option value="">添加颜色…</option>
+              <option v-for="color in markerColors" :key="color.id" :value="String(color.id)">
+                {{ color.label }}
+              </option>
+            </select>
+            <span class="badge" :class="{ good: detectedMarkers.length > 0 }">
+              画面 {{ detectedMarkers.length }} 个
+            </span>
+            <span v-if="savedOverlayMarkers.length" class="badge good">
+              已保存 {{ savedOverlayMarkers.length }} 个
+            </span>
           </div>
+
+          <div v-if="addMarkerColorId" class="action-hint">
+            请在左侧图像点击“{{ colorLabel(addMarkerColorId) }}”标记中心
+          </div>
+          <div v-if="duplicateColorIds.length" class="conflict-text">
+            颜色冲突：{{ duplicateColorIds.map(colorLabel).join('、') }}。每集每色只能一个，修正后才能确认。
+          </div>
+          <div v-if="missingColors.length" class="warning-text">
+            本姿态未检出（可能在另一面）：{{ missingColors.map(colorLabel).join('、') }}
+          </div>
+          <div v-for="warning in markerWarnings" :key="String(warning)" class="warning-text">
+            {{ typeof warning === 'string' ? warning : (warning.message || JSON.stringify(warning)) }}
+          </div>
+
+          <div v-if="detectedMarkers.length" class="marker-list">
+            <div
+              v-for="(marker, index) in detectedMarkers"
+              :key="marker._key"
+              class="marker-row"
+              :class="{ selected: marker._key === selectedMarkerKey }"
+              @click="selectedMarkerKey = marker._key"
+            >
+              <span class="marker-index">{{ index + 1 }}</span>
+              <select
+                class="marker-select"
+                :value="String(markerColorId(marker))"
+                :disabled="isSavedMarker(marker)"
+                @click.stop
+                @change="changeMarkerColor(marker, $event.target.value)"
+              >
+                <option v-for="color in markerColors" :key="color.id" :value="String(color.id)">
+                  {{ color.label }}
+                </option>
+              </select>
+              <span class="coord marker-center-text">
+                {{ Math.round(marker.center[0]) }}, {{ Math.round(marker.center[1]) }}
+              </span>
+              <span v-if="isSavedMarker(marker)" class="badge good">已保存</span>
+              <span
+                v-else
+                class="confidence"
+                :class="{ low: Number(marker.confidence ?? 1) < 0.65 || Number(marker.color_confidence ?? 1) < 0.65 || marker.flags?.length }"
+              >
+                {{ Math.round(Number(marker.confidence ?? 0) * 100) }}%
+              </span>
+              <button
+                v-if="!isSavedMarker(marker)"
+                class="del-btn"
+                title="删除标记"
+                @click.stop="deleteMarker(marker)"
+              >✕</button>
+            </div>
+          </div>
+          <div v-else-if="!markerBusy" class="coord dim">未检测到标记，请重跑或手动补标</div>
+
+          <div class="field-row">
+            <button class="btn primary" :disabled="!canConfirmMarkers" @click="confirmMarkers">
+              {{ markerConfirmBusy ? `确认中… ${confirmElapsedSec}s` : '确认未保存标记' }}
+            </button>
+            <button
+              class="btn primary"
+              :disabled="!markerConfirmSucceeded || markerBatchBusy || markerBatchSaved"
+              @click="saveMarkerBatch"
+            >
+              {{ markerBatchBusy ? '保存中…' : '整批保存观测' }}
+            </button>
+            <span v-if="savedOverlayMarkers.length && !unsavedMarkers.length" class="badge good">本姿态已在磁盘</span>
+            <span v-else-if="markerBatchSaved" class="badge good">已整批保存</span>
+          </div>
+
+          <div v-if="markerConfirmation" class="confirm-summary">
+            <span class="badge" :class="{ good: markerConfirmSucceeded, bad: !markerConfirmSucceeded }">
+              深度成功 {{ confirmedObservations.length }}/{{ unsavedMarkers.length }}
+            </span>
+            <span class="badge">当前总样本 {{ samples.length }}</span>
+          </div>
+          <div v-if="markerConfirmation" class="depth-list">
+            <div v-for="(marker, index) in detectedMarkers" :key="marker._key" class="depth-row">
+              <span>{{ colorLabel(markerColorId(marker)) }}</span>
+              <span v-if="isSavedMarker(marker)" class="coord ok">已在磁盘</span>
+              <template v-else-if="confirmationForMarker(marker, index).observation">
+                <span class="coord ok">
+                  ✓ {{ Math.round(confirmationForMarker(marker, index).observation.depth_mm) }} mm
+                </span>
+              </template>
+              <span v-else-if="confirmationForMarker(marker, index).error" class="err-text">
+                ✕ {{ markerErrorText(confirmationForMarker(marker, index).error) }}
+              </span>
+              <span v-else class="coord dim">待确认</span>
+            </div>
+            <div
+              v-for="message in (markerConfirmation.errors || []).filter((item) => typeof item === 'string')"
+              :key="message"
+              class="err-text"
+            >
+              {{ message }}
+            </div>
+          </div>
+          <div v-if="errorMsg" class="err-text">⚠ {{ errorMsg }}</div>
         </template>
         <template v-else>
+          <h2>1. 当前样本</h2>
           <div class="field-row">
-            <label>腕 xyz (m)</label>
-            <input v-model="wristManual.x" placeholder="x" />
-            <input v-model="wristManual.y" placeholder="y" />
-            <input v-model="wristManual.z" placeholder="z" />
+            <label>P_camera</label>
+            <span v-if="pickBusy" class="coord dim">取点中…</span>
+            <span v-else-if="pick" class="coord ok">
+              [{{ fmt(pick.p_camera[0]) }}, {{ fmt(pick.p_camera[1]) }}, {{ fmt(pick.p_camera[2]) }}] m
+              · 深度 {{ Math.round(pick.depth_mm) }}mm
+            </span>
+            <span v-else class="coord dim">← 在左侧画面上点击标记点</span>
           </div>
-          <div class="field-row">
-            <label>腕 rpy (rad)</label>
-            <input v-model="wristManual.roll" placeholder="roll" />
-            <input v-model="wristManual.pitch" placeholder="pitch" />
-            <input v-model="wristManual.yaw" placeholder="yaw" />
-          </div>
-        </template>
 
-        <div class="field-row">
-          <label></label>
-          <button class="btn primary" :disabled="!canSave" @click="saveSample">保存这个样本</button>
-        </div>
-        <div v-if="errorMsg" class="err-text">⚠ {{ errorMsg }}</div>
+          <template v-if="autoPose">
+            <div class="field-row">
+              <label>手腕位姿</label>
+              <span v-if="wristT" class="coord ok">t = {{ wristSummary(wristT) }} m（自动）</span>
+              <span v-else class="coord dim">点击取点时自动抓取</span>
+              <button class="btn" @click="readWristPose">重读</button>
+            </div>
+          </template>
+          <template v-else>
+            <div class="field-row">
+              <label>腕 xyz (m)</label>
+              <input v-model="wristManual.x" placeholder="x" />
+              <input v-model="wristManual.y" placeholder="y" />
+              <input v-model="wristManual.z" placeholder="z" />
+            </div>
+            <div class="field-row">
+              <label>腕 rpy (rad)</label>
+              <input v-model="wristManual.roll" placeholder="roll" />
+              <input v-model="wristManual.pitch" placeholder="pitch" />
+              <input v-model="wristManual.yaw" placeholder="yaw" />
+            </div>
+          </template>
+
+          <div class="field-row">
+            <label></label>
+            <button class="btn primary" :disabled="!canSave" @click="saveSample">保存这个样本</button>
+          </div>
+          <div v-if="errorMsg" class="err-text">⚠ {{ errorMsg }}</div>
+        </template>
       </div>
 
       <!-- 样本列表 -->
@@ -482,7 +1178,8 @@ onMounted(async () => {
         <table v-if="samples.length">
           <thead>
             <tr>
-              <th>#</th><th>P_camera (m)</th><th>腕 t (m)</th><th></th>
+              <th>#</th><th>P_camera (m)</th><th>腕 t (m)</th>
+              <th>颜色</th><th>剧集</th><th></th>
             </tr>
           </thead>
           <tbody>
@@ -490,6 +1187,8 @@ onMounted(async () => {
               <td>{{ s.index }}</td>
               <td>{{ s.p_camera.map((v) => fmt(v, 3)).join(', ') }}</td>
               <td>{{ wristSummary(s.T_base_wrist) }}</td>
+              <td>{{ sampleMarkerLabel(s) }}</td>
+              <td>{{ s.episode || s.provenance?.episode || '—' }}</td>
               <td><button class="del-btn" title="删除" @click="deleteSample(s.index)">✕</button></td>
             </tr>
           </tbody>
@@ -505,23 +1204,48 @@ onMounted(async () => {
         </button>
         <template v-if="result">
           <div style="margin-top: 10px; display: flex; gap: 8px; flex-wrap: wrap;">
-            <span class="badge" :class="result.residual_mm.rms < 8 ? 'good' : 'bad'">
+            <span
+              v-if="result.residual_mm?.rms != null"
+              class="badge"
+              :class="result.residual_mm.rms < 8 ? 'good' : 'bad'"
+            >
               拟合 RMS {{ fmt(result.residual_mm.rms, 2) }} mm
             </span>
             <span v-if="result.leave_one_out_stats_mm" class="badge"
                   :class="result.leave_one_out_stats_mm.mean < 10 ? 'good' : 'bad'">
               留一验证均值 {{ fmt(result.leave_one_out_stats_mm.mean, 2) }} mm
             </span>
-            <span class="badge">
+            <span v-if="!isMultiResult && result.p_tool_wrist_m" class="badge">
               p_tool(腕系) [{{ result.p_tool_wrist_m.map((v) => fmt(v, 3)).join(', ') }}] m
             </span>
-            <span class="badge">
+            <span v-if="result.rpy_deg" class="badge">
               rpy(deg) [{{ result.rpy_deg.map((v) => fmt(v, 2)).join(', ') }}]
             </span>
-            <span class="badge">腕姿态跨度 {{ fmt(result.wrist_rotation_spread_deg, 1) }}°</span>
+            <span v-if="result.wrist_rotation_spread_deg != null" class="badge">
+              腕姿态跨度 {{ fmt(result.wrist_rotation_spread_deg, 1) }}°
+            </span>
+            <span v-if="isMultiResult" class="badge good">
+              多标记联合解算
+            </span>
+            <span v-if="result.pose_count != null" class="badge">姿态 {{ result.pose_count }}</span>
+            <span v-if="result.marker_count != null" class="badge">标记 {{ result.marker_count }}</span>
           </div>
-          <div class="result-box" style="margin-top: 10px;">{{ matrixText }}</div>
-          <div class="video-hint">已保存到 {{ result.saved_to }}</div>
+          <table v-if="multiMarkerRows.length" class="multi-result-table">
+            <thead>
+              <tr><th>标记</th><th>p_tool 腕系 (m)</th><th>RMS (mm)</th><th>最大 (mm)</th><th>样本</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="row in multiMarkerRows" :key="row.id">
+                <td>{{ colorLabel(row.id) }}</td>
+                <td>{{ row.offset.length ? row.offset.map((v) => fmt(v, 4)).join(', ') : '—' }}</td>
+                <td>{{ row.residual.rms != null ? fmt(row.residual.rms, 2) : '—' }}</td>
+                <td>{{ row.residual.max != null ? fmt(row.residual.max, 2) : '—' }}</td>
+                <td>{{ row.residual.count ?? row.residual.sample_count ?? '—' }}</td>
+              </tr>
+            </tbody>
+          </table>
+          <div v-if="matrixText" class="result-box" style="margin-top: 10px;">{{ matrixText }}</div>
+          <div v-if="result.saved_to" class="video-hint">已保存到 {{ result.saved_to }}</div>
         </template>
 
         <div class="field-row" style="margin-top: 12px;">
@@ -625,3 +1349,201 @@ onMounted(async () => {
     </div>
   </div>
 </template>
+
+<style scoped>
+.offline-panel {
+  margin-bottom: 12px;
+}
+
+.offline-panel h2 {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.refresh-btn {
+  padding: 4px 10px;
+}
+
+.episode-list {
+  display: grid;
+  gap: 6px;
+  max-height: 260px;
+  overflow-y: auto;
+}
+
+.episode-item {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  width: 100%;
+  padding: 9px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+}
+
+.episode-item:hover,
+.episode-item.selected {
+  border-color: var(--accent);
+  background: var(--panel-hover);
+}
+
+.episode-item:disabled {
+  cursor: wait;
+  opacity: .65;
+}
+
+.episode-item.selected {
+  box-shadow: inset 3px 0 var(--accent);
+}
+
+.episode-main {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.episode-main b {
+  overflow-wrap: anywhere;
+}
+
+.episode-meta {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.image-loading {
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(15, 17, 23, .62);
+  color: var(--text);
+  font-size: 13px;
+  pointer-events: none;
+}
+
+.marker-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.marker-select {
+  min-width: 100px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.marker-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.action-hint,
+.warning-text,
+.conflict-text {
+  margin: 6px 0;
+  font-size: 12px;
+}
+
+.action-hint {
+  color: var(--accent);
+}
+
+.warning-text {
+  color: var(--warn);
+}
+
+.conflict-text {
+  color: var(--err);
+}
+
+.marker-list {
+  display: grid;
+  gap: 5px;
+  max-height: 280px;
+  margin: 10px 0;
+  overflow-y: auto;
+}
+
+.marker-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 6px 7px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  cursor: pointer;
+}
+
+.marker-row:hover,
+.marker-row.selected {
+  border-color: var(--accent);
+  background: var(--panel-hover);
+}
+
+.marker-index {
+  width: 18px;
+  color: var(--text-dim);
+  font-family: monospace;
+}
+
+.marker-center-text {
+  flex: 1;
+  color: var(--text-dim);
+  text-align: right;
+}
+
+.confidence {
+  min-width: 36px;
+  color: var(--ok);
+  font-family: monospace;
+  font-size: 11px;
+  text-align: right;
+}
+
+.confidence.low {
+  color: var(--warn);
+}
+
+.confirm-summary {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin: 8px 0;
+}
+
+.depth-list {
+  display: grid;
+  gap: 4px;
+}
+
+.depth-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 5px 7px;
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+}
+
+.depth-row .err-text {
+  margin-top: 0;
+}
+
+.multi-result-table {
+  margin-top: 10px;
+}
+</style>

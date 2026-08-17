@@ -17,8 +17,9 @@
 
 ## 坐标系约定
 
-- \(P_{camera}\)：**彩色相机坐标系**（深度经 AlignFilter 对齐到彩色后用彩色
-  内参反投影；X 右、Y 下、Z 前，米）。与 video_tools 的彩色点云同系，
+- \(P_{camera}\)：**彩色相机坐标系**（生产模式使用本地导出的 RGB-D 内外参，
+  将 ZMQ 原始深度软件对齐到彩色后再用彩色内参反投影；X 右、Y 下、Z 前，米）。
+  与 video_tools 的彩色点云同系，
   解出的 T 可直接用于点云。
 - \(T_{base}^{wrist}\)：H2 模式下 base = `torso_link`、wrist = `right_wrist_yaw_link`
   （取自 IK_replay 的 h2.yaml），FK 只用手臂 7 关节。
@@ -28,7 +29,7 @@
 ```
 backend/
   solver.py    Kabsch + 联合解(交替 LS) + 留一验证 + 退化检测
-  camera.py    Orbbec RGBD（pyorbbecsdk）+ mock
+  camera.py    teleimager ZMQ RGB-D（生产）+ Orbbec SDK（显式调试）+ mock
   robot.py     手腕位姿 Provider：manual / http / h2(DDS+FK) / mock
   app.py       FastAPI：预览、点击反投影、样本管理、解算
 run_server.py  入口（后端 8132）
@@ -38,7 +39,7 @@ frontend/      Vue3 + Vite 界面（端口 7012）
 ## 环境
 
 ```bash
-pip install -r backend/requirements.txt   # fastapi uvicorn numpy opencv-python pyorbbecsdk2
+pip install -r backend/requirements.txt   # 包含 pyzmq；pyorbbecsdk2 仅供显式 SDK 调试
 cd frontend && npm install
 ```
 
@@ -50,16 +51,19 @@ unifolm-wma 环境跑本服务 / 在 unifolm-wma 里跑一个 pose sidecar 走
 ## 启动
 
 ```bash
-# H2 真机（推荐）：DDS 只读 rt/lowstate + IK_replay FK，右臂
-python run_server.py --camera-source orbbec --camera-serial CP0BB53000FS \
+# H2 真机（推荐）：teleimager ZMQ RGB-D + DDS 只读 rt/lowstate + IK_replay FK
+python run_server.py --camera-source zmq --camera-host 127.0.0.1 \
     --pose-source h2 --network-interface eth0
 
 # H2 真机 + 网页点动/卸力（发布 rt/arm_sdk，真机会动！确保没有其他控制程序）
-python run_server.py --camera-source orbbec --camera-serial CP0BB53000FS \
+python run_server.py --camera-source zmq --camera-host 127.0.0.1 \
     --pose-source h2 --network-interface eth0 --arm-control
 
 # 手腕位姿手填（任何机器人可用）
-python run_server.py --camera-source orbbec
+python run_server.py --camera-source zmq
+
+# 仅限明确需要本机 SDK 调试时使用（会直接打开并占用相机）
+python run_server.py --camera-source orbbec --camera-serial CP0BB53000FS
 
 # 纯联调
 python run_server.py --camera-source mock --pose-source mock
@@ -70,6 +74,45 @@ cd frontend && npm run dev     # http://<IP>:7012
 
 > 默认 H2 模式**只订阅** `rt/lowstate`，绝不发布 `rt/arm_sdk`/`rt/lowcmd`，
 > 与现有控制程序并存不会引起抢占/抽搐。摆位姿用你现有的控制方式。
+> 默认相机模式也只订阅 teleimager ZMQ，不会启动 SDK 或直接打开 USB 相机。
+
+### 导入 eai-teleop-studio 离线采集数据
+
+本项目可以直接读取 eai-teleop-studio 的手眼标定任务目录：
+
+```bash
+./start.sh \
+  --teleop-task-dir /home/robot/yx/project/calib/hand_eye_3D/teleop_data/biaoding \
+  --rgbd-calib /home/robot/yx/project/IK_replay/config/camera/orbbec_rgbd_calibration.json
+```
+
+离线模式不会打开 Orbbec、不会连接 DDS，也不会控制机器人。后端会复用
+IK_replay 的 H2 URDF/FK 和 `SoftwareDepthAligner`：
+
+1. 网页左侧选择一个 `episode_*`，显示该点位 5 帧中的代表 RGB。检测器先寻找
+   手部附近的 8 mm 圆形，再按圆心区域的 HSV/Lab 颜色分类。
+2. 每个姿态只确认手心或手背当前实际可见的颜色，不要求同一帧凑齐九色。在 SVG
+   叠加层中逐个检查圆心和颜色；可以拖动圆心、修改颜色、删除误检或补充漏检。
+   灰色、金色和棕色受光照影响较大，必须重点检查。
+3. 点击「确认全部标记」。后端将全部 raw `uint16` 深度只配准一次，分别取各圆心
+   的 5 帧深度中值并反投影为彩色相机系 `p_camera`。任何无稳定深度的圆都会明确
+   报错，修正圆心后重新确认。
+4. 后端对 5 帧右臂实测关节角取中值，通过 H2 FK 计算
+   `T_torso_link←right_wrist_yaw_link`。
+5. 点击「整批保存观测」，再处理下一个 episode。至少需要 3 个不同姿态，每种参与
+   解算的颜色必须覆盖至少 2 个姿态；建议采集 12–20 个手腕朝向充分分散的姿态，
+   然后点击「解算」。
+
+多标记求解共享同一个 `T_base←camera`，并为每种颜色独立估计固定的腕系位置
+`p_tool_wrist_m_by_marker[color]`。它允许部分圆被遮挡。相比每个姿态只用一个点，
+正确标注的多点能提高约束数量和抗随机深度噪声能力；但错误颜色、错误圆心和反光
+深度属于系统误差，不会因为点数多而自动消失。
+
+转换后的 `samples/*.json`、来源信息和最终 `handeye3d_result.json` 默认保存在
+本项目的 `handeye3d_data/<时间戳>/` 下。列表会显示每个 episode 已导入的颜色
+数量，同一 episode 的同一种颜色不能重复保存。RGB-D 相机序列号、分辨率、深度
+类型或右臂关节顺序与 JSON 标定不一致时，导入会直接拒绝，不会使用错误几何继续
+解算。旧的单点样本仍可单独解算，但不能与多标记样本混在同一次解算中。
 
 ### --arm-control 手臂点动（可选）
 

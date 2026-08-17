@@ -10,7 +10,18 @@ export default defineConfig({
     host: '0.0.0.0',
     port: 7012,
     proxy: {
-      '/api': BACKEND,
+      '/api': {
+        target: BACKEND,
+        timeout: 120000,
+        proxyTimeout: 120000,
+        configure(proxy) {
+          proxy.on('proxyReq', (proxyReq, req) => {
+            req.on('close', () => {
+              if (!req.complete) proxyReq.destroy()
+            })
+          })
+        },
+      },
     },
   },
 })

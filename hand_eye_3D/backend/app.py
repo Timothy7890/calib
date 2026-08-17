@@ -11,25 +11,34 @@ import asyncio
 import json
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 from .camera import CameraBase, MockCamera
+from .offline import (
+    DEFAULT_RGBD_CALIB_PATH,
+    EpisodeValidationError,
+    OfflineEpisodeBackend,
+)
+from .markers import CANONICAL_COLORS, canonical_color, marker_catalog_public
 from .robot import ManualPoseProvider, PoseProvider
 from .solver import (
     MIN_SAMPLES_PIVOT,
     MIN_SAMPLES_TOOL,
     MIN_SAMPLES_TOOL_ONLY,
+    leave_one_pose_out_multi,
     leave_one_out_pivot,
     leave_one_out_tool,
     make_T,
     rpy_to_rot,
     solve_pivot,
+    solve_multi_marker,
     solve_tool_fixed_cam,
     solve_with_tool_offset,
 )
@@ -42,6 +51,10 @@ arm_factory = None      # run_server 传 --arm-control 时注入（工厂，点�
 arm_controller = None   # 当前接管中的 H2ArmController（None = 未接管）
 arm_lock = threading.Lock()
 save_path: Path = Path("./handeye3d_data")
+offline_backend: OfflineEpisodeBackend | None = None
+teleop_task_dir: Path | None = None
+rgbd_calib_path: Path = DEFAULT_RGBD_CALIB_PATH
+samples_lock = threading.Lock()
 
 app = FastAPI(title="Hand-Eye 3D (point + wrist-pose) Calibration")
 app.add_middleware(
@@ -72,9 +85,50 @@ def _load_samples() -> list[dict]:
     return items
 
 
+def _imported_episode(sample: dict):
+    value = sample.get("episode")
+    source = sample.get("provenance")
+    if value is None and isinstance(source, dict):
+        value = source.get("episode")
+    return value
+
+
+def _sample_schema_version(sample: dict) -> int:
+    value = sample.get("schema_version", 1)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return -1
+
+
 def _next_index() -> int:
     used = [int(p.stem) for p in _samples_dir().glob("*.json") if p.stem.isdigit()]
     return (max(used) + 1) if used else 0
+
+
+def _active_pose_source() -> str:
+    return "offline_teleop_episode" if offline_backend is not None else pose_provider.source
+
+
+def _active_base_link() -> str:
+    return offline_backend.base_link if offline_backend is not None else pose_provider.base_link
+
+
+def _active_wrist_link() -> str:
+    return offline_backend.wrist_link if offline_backend is not None else pose_provider.wrist_link
+
+
+def _active_camera_info() -> dict:
+    if offline_backend is None:
+        return camera.info()
+    color_h, color_w = offline_backend.calibration.color_shape
+    return {
+        "source": "offline_teleop_episode",
+        "serial": offline_backend.calibration.serial,
+        "name": "Recorded Orbbec RGB-D",
+        "width": color_w,
+        "height": color_h,
+    }
 
 
 # --------------- 状态 / 相机 ---------------
@@ -83,20 +137,39 @@ def _next_index() -> int:
 @app.get("/api/status")
 async def api_status():
     return {
-        "camera": camera.info(),
-        "pose_source": pose_provider.source,
-        "pose_auto": pose_provider.available,
-        "base_link": pose_provider.base_link,
-        "wrist_link": pose_provider.wrist_link,
+        "mode": "offline" if offline_backend is not None else "live",
+        "camera": _active_camera_info(),
+        "pose_source": _active_pose_source(),
+        "pose_auto": False if offline_backend is not None else pose_provider.available,
+        "base_link": _active_base_link(),
+        "wrist_link": _active_wrist_link(),
         "save_path": str(save_path),
         "sample_count": len(_load_samples()),
         "min_samples": MIN_SAMPLES_TOOL,
+        "teleop_task_dir": str(teleop_task_dir) if teleop_task_dir else None,
+        "rgbd_calib": str(rgbd_calib_path),
+        "offline": {
+            "enabled": offline_backend is not None,
+            "teleop_task_dir": str(teleop_task_dir) if teleop_task_dir else None,
+            "rgbd_calib": str(rgbd_calib_path),
+        },
     }
+
+
+@app.get("/api/markers/colors")
+async def api_marker_colors():
+    colors = marker_catalog_public()
+    return {"ok": True, "colors": colors, "count": len(colors)}
 
 
 @app.get("/api/stream")
 async def api_stream():
     """彩色相机 MJPEG 预览流。"""
+    if offline_backend is not None:
+        return JSONResponse(
+            {"ok": False, "error": "离线模式没有实时相机流"},
+            status_code=409,
+        )
 
     def gen():
         while True:
@@ -123,6 +196,171 @@ async def api_pick(body: dict):
     result = await asyncio.to_thread(camera.pick, u, v)
     status = 200 if result.get("ok") else 502
     return JSONResponse(result, status_code=status)
+
+
+@app.get("/api/offline/episodes")
+async def api_offline_episodes():
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    scanned = await asyncio.to_thread(offline_backend.scan)
+    saved_samples = _load_samples()
+    imported = {_imported_episode(item) for item in saved_samples}
+    episodes = []
+    errors = []
+    for item in scanned:
+        if item.get("valid"):
+            episode_samples = [
+                sample
+                for sample in saved_samples
+                if _imported_episode(sample) == item["name"]
+            ]
+            imported_marker_ids = sorted(
+                {
+                    sample["marker_id"]
+                    for sample in episode_samples
+                    if _sample_schema_version(sample) == 2
+                    and isinstance(sample.get("marker_id"), str)
+                }
+            )
+            item["imported_marker_ids"] = imported_marker_ids
+            item["imported_marker_count"] = len(imported_marker_ids)
+            item["already_imported"] = item["name"] in imported
+            episodes.append(item)
+        else:
+            errors.append(item)
+    return {
+        "ok": True,
+        "episodes": episodes,
+        "count": len(episodes),
+        "invalid_episodes": errors,
+    }
+
+
+@app.get("/api/offline/episodes/{name}/preview")
+async def api_offline_preview(name: str):
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    try:
+        jpeg = await asyncio.to_thread(offline_backend.preview_jpeg, name)
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    return Response(
+        content=jpeg,
+        media_type="image/jpeg",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.get("/api/offline/episodes/{name}/depth-overlay")
+async def api_offline_depth_overlay(name: str):
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    try:
+        png = await asyncio.to_thread(offline_backend.depth_overlay_png, name)
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"深度叠加生成失败: {exc}"}, status_code=422
+        )
+    return Response(
+        content=png,
+        media_type="image/png",
+        headers={"Cache-Control": "no-cache"},
+    )
+
+
+@app.post("/api/offline/pick")
+async def api_offline_pick(body: dict):
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    try:
+        name = body["episode"]
+        if not isinstance(name, str):
+            raise ValueError("episode 必须是字符串")
+        u, v = int(body["u"]), int(body["v"])
+    except (KeyError, TypeError, ValueError) as exc:
+        message = str(exc) if str(exc) else "需要 episode、整数 u 和整数 v"
+        return JSONResponse({"ok": False, "error": message}, status_code=400)
+    try:
+        result = await asyncio.to_thread(offline_backend.pick, name, u, v)
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"离线 episode 处理失败: {exc}"}, status_code=422
+        )
+    return result
+
+
+@app.post("/api/offline/detect-markers")
+async def api_offline_detect_markers(body: dict):
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    try:
+        name = body["episode"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("episode 必须是非空字符串")
+    except (KeyError, TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    try:
+        result = await asyncio.to_thread(offline_backend.detect_markers, name.strip())
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"marker 检测失败: {exc}"}, status_code=422
+        )
+    return result
+
+
+@app.post("/api/offline/confirm-markers")
+async def api_offline_confirm_markers(body: dict):
+    if offline_backend is None:
+        return JSONResponse(
+            {"ok": False, "error": "未配置离线遥操作任务目录，请用 --teleop-task-dir 启动"},
+            status_code=409,
+        )
+    try:
+        name = body["episode"]
+        markers = body["markers"]
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("episode 必须是非空字符串")
+        if not isinstance(markers, list):
+            raise ValueError("markers 必须是数组")
+    except (KeyError, TypeError, ValueError) as exc:
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
+    try:
+        result = await asyncio.to_thread(
+            offline_backend.confirm_markers, name.strip(), markers
+        )
+    except EpisodeValidationError as exc:
+        status = 404 if "元数据不存在" in str(exc) else 422
+        return JSONResponse({"ok": False, "error": str(exc)}, status_code=status)
+    except (OSError, ValueError) as exc:
+        return JSONResponse(
+            {"ok": False, "error": f"离线 episode 处理失败: {exc}"}, status_code=422
+        )
+    return result
 
 
 @app.get("/api/wrist_pose")
@@ -303,19 +541,231 @@ async def api_add_sample(body: dict):
                                    "像是点到背景（边缘飞点）或离相机太近——往手指内侧一点重新点击"},
             status_code=400)
 
-    index = _next_index()
-    record = {
-        "index": index,
-        "datetime": datetime.now().isoformat(timespec="seconds"),
-        "p_camera": p_cam.tolist(),
-        "T_base_wrist": T_wrist.tolist(),
-        "pixel": body.get("pixel"),
-        "pose_source": pose_provider.source,
-        "camera": {k: camera.info().get(k) for k in ("serial", "source")},
-    }
-    (_samples_dir() / f"{index:04d}.json").write_text(
-        json.dumps(record, indent=2, ensure_ascii=False))
+    episode = body.get("episode")
+    provenance = body.get("provenance")
+    if episode is not None and (not isinstance(episode, str) or not episode.strip()):
+        return JSONResponse(
+            {"ok": False, "error": "episode 必须是非空字符串"}, status_code=400)
+    if episode is not None:
+        episode = episode.strip()
+    if provenance is not None and not isinstance(provenance, dict):
+        return JSONResponse(
+            {"ok": False, "error": "provenance 必须是 JSON object"}, status_code=400)
+
+    with samples_lock:
+        if episode is not None:
+            duplicate = next(
+                (sample for sample in _load_samples()
+                 if _imported_episode(sample) == episode),
+                None,
+            )
+            if duplicate is not None:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"episode {episode} 已导入为样本 {duplicate.get('index')}",
+                        "duplicate_episode": episode,
+                        "existing_index": duplicate.get("index"),
+                    },
+                    status_code=409,
+                )
+        index = _next_index()
+        record = {
+            "schema_version": 1,
+            "index": index,
+            "datetime": datetime.now().isoformat(timespec="seconds"),
+            "p_camera": p_cam.tolist(),
+            "T_base_wrist": T_wrist.tolist(),
+            "pixel": body.get("pixel"),
+            "pose_source": _active_pose_source(),
+            "camera": {
+                k: _active_camera_info().get(k) for k in ("serial", "source")
+            },
+        }
+        if episode is not None:
+            record["episode"] = episode
+        if provenance is not None:
+            record["provenance"] = provenance
+        (_samples_dir() / f"{index:04d}.json").write_text(
+            json.dumps(record, indent=2, ensure_ascii=False))
     return {"ok": True, "index": index, "count": len(_load_samples())}
+
+
+def _validated_v2_observation(
+    observation: dict, episode: str, position: int
+) -> dict:
+    if not isinstance(observation, dict):
+        raise ValueError(f"第 {position} 个 observation 必须是 JSON object")
+    if observation.get("schema_version") != 2:
+        raise ValueError(f"第 {position} 个 observation 的 schema_version 必须是 2")
+    marker_id = observation.get("marker_id", observation.get("id"))
+    if not isinstance(marker_id, str) or not marker_id.strip():
+        raise ValueError(f"第 {position} 个 observation 缺少非空 marker_id")
+    marker_id = marker_id.strip()
+    color = canonical_color(observation.get("color"))
+    observation_episode = observation.get("episode", episode)
+    if observation_episode != episode:
+        raise ValueError(
+            f"第 {position} 个 observation 的 episode {observation_episode!r} "
+            f"与批次 {episode!r} 不一致"
+        )
+    pose_id = observation.get("pose_id")
+    if not isinstance(pose_id, (str, int)) or not str(pose_id).strip():
+        raise ValueError(f"第 {position} 个 observation 缺少非空 pose_id")
+    try:
+        p_cam = np.asarray(observation["p_camera"], dtype=float).reshape(3)
+        T_wrist = _parse_wrist_pose(observation)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError(f"第 {position} 个 observation 坐标/位姿不合法: {exc}") from exc
+    if not np.all(np.isfinite(p_cam)):
+        raise ValueError(f"第 {position} 个 observation 的 p_camera 包含非法值")
+    if not (DEPTH_MIN_M <= float(p_cam[2]) <= DEPTH_MAX_M):
+        raise ValueError(
+            f"第 {position} 个 observation 深度 {p_cam[2]:.2f}m 超出 "
+            f"{DEPTH_MIN_M}~{DEPTH_MAX_M}m"
+        )
+    provenance = observation.get("provenance")
+    if provenance is not None and not isinstance(provenance, dict):
+        raise ValueError(f"第 {position} 个 observation 的 provenance 必须是 JSON object")
+
+    record = dict(observation)
+    record.update(
+        {
+            "schema_version": 2,
+            "episode": episode,
+            "pose_id": str(pose_id).strip(),
+            "marker_id": marker_id,
+            "id": marker_id,
+            "color": color,
+            "p_camera": p_cam.tolist(),
+            "T_base_wrist": T_wrist.tolist(),
+        }
+    )
+    return record
+
+
+@app.post("/api/samples/batch")
+async def api_add_samples_batch(body: dict):
+    try:
+        episode = body["episode"]
+        observations = body["observations"]
+        if not isinstance(episode, str) or not episode.strip():
+            raise ValueError("episode 必须是非空字符串")
+        episode = episode.strip()
+        if not isinstance(observations, list) or not observations:
+            raise ValueError("observations 必须是非空数组")
+        records = [
+            _validated_v2_observation(observation, episode, position)
+            for position, observation in enumerate(observations)
+        ]
+    except (KeyError, TypeError, ValueError) as exc:
+        message = str(exc) or "需要 episode 和 observations"
+        return JSONResponse({"ok": False, "error": message}, status_code=400)
+
+    marker_ids = [record["marker_id"] for record in records]
+    colors = [record["color"] for record in records]
+    if len(set(marker_ids)) != len(marker_ids):
+        return JSONResponse(
+            {"ok": False, "error": "同一批次 marker_id 必须唯一"}, status_code=400
+        )
+    if len(set(colors)) != len(colors):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "同一 episode 中每种 canonical color 只能保存一个 marker",
+            },
+            status_code=400,
+        )
+
+    with samples_lock:
+        existing = _load_samples()
+        existing_v2 = [
+            sample
+            for sample in existing
+            if _sample_schema_version(sample) == 2
+            and _imported_episode(sample) == episode
+        ]
+        existing_keys = {
+            (episode, sample.get("marker_id")): sample
+            for sample in existing_v2
+            if isinstance(sample.get("marker_id"), str)
+        }
+        existing_colors = {
+            sample.get("color"): sample
+            for sample in existing_v2
+            if sample.get("color") in CANONICAL_COLORS
+        }
+        for record in records:
+            duplicate = existing_keys.get((episode, record["marker_id"]))
+            if duplicate is not None:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"episode {episode} 的 marker "
+                        f"{record['marker_id']} 已导入为样本 {duplicate.get('index')}",
+                        "duplicate_key": [episode, record["marker_id"]],
+                        "existing_index": duplicate.get("index"),
+                    },
+                    status_code=409,
+                )
+            same_color = existing_colors.get(record["color"])
+            if same_color is not None:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"episode {episode} 已保存 {record['color']} marker "
+                        f"为样本 {same_color.get('index')}",
+                        "duplicate_color": record["color"],
+                        "existing_index": same_color.get("index"),
+                    },
+                    status_code=409,
+                )
+
+        first_index = _next_index()
+        indices = list(range(first_index, first_index + len(records)))
+        now = datetime.now().isoformat(timespec="seconds")
+        token = uuid.uuid4().hex
+        staged: list[tuple[Path, Path]] = []
+        installed: list[Path] = []
+        try:
+            for index, record in zip(indices, records):
+                saved = dict(record)
+                saved.update(
+                    {
+                        "index": index,
+                        "datetime": now,
+                        "pose_source": _active_pose_source(),
+                        "camera": {
+                            key: _active_camera_info().get(key)
+                            for key in ("serial", "source")
+                        },
+                    }
+                )
+                final_path = _samples_dir() / f"{index:04d}.json"
+                temp_path = _samples_dir() / f".batch-{token}-{index:04d}.tmp"
+                temp_path.write_text(
+                    json.dumps(saved, indent=2, ensure_ascii=False), encoding="utf-8"
+                )
+                staged.append((temp_path, final_path))
+            for temp_path, final_path in staged:
+                temp_path.replace(final_path)
+                installed.append(final_path)
+        except OSError as exc:
+            for temp_path, _ in staged:
+                temp_path.unlink(missing_ok=True)
+            for final_path in installed:
+                final_path.unlink(missing_ok=True)
+            return JSONResponse(
+                {"ok": False, "error": f"批量保存失败，未保留部分结果: {exc}"},
+                status_code=500,
+            )
+    return {
+        "ok": True,
+        "episode": episode,
+        "indices": indices,
+        "saved_count": len(indices),
+        "count": len(_load_samples()),
+    }
 
 
 @app.delete("/api/samples/{index}")
@@ -396,8 +846,8 @@ async def api_solve_tool(body: dict | None = None):
     result["dropped_samples"] = dropped
     result["solved_at"] = datetime.now().isoformat(timespec="seconds")
     result["calib_used"] = str(calib_path)
-    result["base_link"] = pose_provider.base_link
-    result["wrist_link"] = pose_provider.wrist_link
+    result["base_link"] = _active_base_link()
+    result["wrist_link"] = _active_wrist_link()
 
     old = np.asarray(calib.get("p_tool_wrist_m", []), dtype=float)
     new = np.asarray(result["p_tool_wrist_m"], dtype=float)
@@ -513,8 +963,8 @@ async def api_pivot_solve():
     result["ok"] = True
     result["sample_indices"] = [s["index"] for s in samples]
     result["solved_at"] = datetime.now().isoformat(timespec="seconds")
-    result["base_link"] = pose_provider.base_link
-    result["wrist_link"] = pose_provider.wrist_link
+    result["base_link"] = _active_base_link()
+    result["wrist_link"] = _active_wrist_link()
 
     # 与现有手眼标定的 p_tool 对比（若有），并生成一份"替换了 p_tool 的完整
     # 标定文件"（handeye3d_result_pivot.json），可直接给 reach_server --calib 用
@@ -548,30 +998,81 @@ async def api_pivot_solve():
 @app.post("/api/solve")
 async def api_solve():
     samples = _load_samples()
-    if len(samples) < MIN_SAMPLES_TOOL:
+    versions = {_sample_schema_version(sample) for sample in samples}
+    if not samples:
         return JSONResponse(
-            {"ok": False, "error": f"联合解至少 {MIN_SAMPLES_TOOL} 个样本，当前 {len(samples)} 个"},
+            {"ok": False, "error": "没有可用于联合解的样本"},
             status_code=400)
-    p_cam = np.array([s["p_camera"] for s in samples])
-    T_wrist = np.array([s["T_base_wrist"] for s in samples])
+    if not versions.issubset({1, 2}):
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": f"样本包含不支持的 schema_version: {sorted(versions)}",
+            },
+            status_code=400,
+        )
+    if versions == {1, 2}:
+        return JSONResponse(
+            {
+                "ok": False,
+                "error": "样本同时包含 legacy v1 和 multi-marker v2，不能混合解算；"
+                "请分开保存到不同标定会话",
+            },
+            status_code=400,
+        )
+
     try:
-        result = await asyncio.to_thread(solve_with_tool_offset, p_cam, T_wrist)
-    except ValueError as exc:
+        p_cam = np.array([s["p_camera"] for s in samples])
+        T_wrist = np.array([s["T_base_wrist"] for s in samples])
+        if versions == {2}:
+            marker_labels = [canonical_color(s["color"]) for s in samples]
+            pose_ids = [s["pose_id"] for s in samples]
+            result = await asyncio.to_thread(
+                solve_multi_marker, p_cam, T_wrist, marker_labels, pose_ids
+            )
+            result["leave_one_pose_out"] = await asyncio.to_thread(
+                leave_one_pose_out_multi,
+                p_cam,
+                T_wrist,
+                marker_labels,
+                pose_ids,
+            )
+            for residual, sample in zip(
+                result["per_observation_residuals"], samples
+            ):
+                residual["sample_index"] = sample.get("index")
+                residual["marker_id"] = sample.get("marker_id")
+                residual["color"] = sample.get("color")
+        else:
+            if len(samples) < MIN_SAMPLES_TOOL:
+                return JSONResponse(
+                    {
+                        "ok": False,
+                        "error": f"联合解至少 {MIN_SAMPLES_TOOL} 个样本，"
+                        f"当前 {len(samples)} 个",
+                    },
+                    status_code=400,
+                )
+            result = await asyncio.to_thread(
+                solve_with_tool_offset, p_cam, T_wrist
+            )
+            loo = await asyncio.to_thread(leave_one_out_tool, p_cam, T_wrist)
+            result["leave_one_out_mm"] = loo
+            finite = [e for e in loo if np.isfinite(e)]
+            if finite:
+                result["leave_one_out_stats_mm"] = {
+                    "mean": float(np.mean(finite)), "max": float(np.max(finite)),
+                }
+    except (KeyError, TypeError, ValueError) as exc:
         return JSONResponse({"ok": False, "error": str(exc)}, status_code=400)
 
-    loo = await asyncio.to_thread(leave_one_out_tool, p_cam, T_wrist)
-    result["leave_one_out_mm"] = loo
-    finite = [e for e in loo if np.isfinite(e)]
-    if finite:
-        result["leave_one_out_stats_mm"] = {
-            "mean": float(np.mean(finite)), "max": float(np.max(finite)),
-        }
     result["ok"] = True
     result["sample_indices"] = [s["index"] for s in samples]
+    result["schema_version"] = 2 if versions == {2} else 1
     result["solved_at"] = datetime.now().isoformat(timespec="seconds")
-    result["base_link"] = pose_provider.base_link
-    result["wrist_link"] = pose_provider.wrist_link
-    result["camera"] = camera.info()
+    result["base_link"] = _active_base_link()
+    result["wrist_link"] = _active_wrist_link()
+    result["camera"] = _active_camera_info()
 
     out = save_path / "handeye3d_result.json"
     out.write_text(json.dumps(result, indent=2, ensure_ascii=False))

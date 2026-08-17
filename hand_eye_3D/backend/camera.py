@@ -1,7 +1,7 @@
-"""Orbbec RGBD 相机封装：彩色预览 + 对齐深度 + 像素反投影。
+"""RGB-D 相机封装：ZMQ 生产输入、Orbbec SDK 调试输入和 mock。
 
 坐标系约定（与 video_tools 的彩色点云一致）：
-深度经 AlignFilter 对齐到彩色相机，pick() 反投影用彩色内参，
+深度对齐到彩色相机后，pick() 用彩色内参反投影，
 因此返回的 P_camera 在【彩色相机坐标系】下（X 右、Y 下、Z 前，米）。
 后续标定得到的 T_base^camera 也就是彩色相机的位姿。
 """
@@ -11,6 +11,8 @@ from __future__ import annotations
 import threading
 import time
 from collections import deque
+from pathlib import Path
+import sys
 
 import cv2
 import numpy as np
@@ -347,9 +349,38 @@ class OrbbecRGBDCamera(CameraBase):
         }
 
 
-def make_camera(source: str, serial: str | None = None) -> CameraBase:
+def make_camera(
+    source: str,
+    serial: str | None = None,
+    *,
+    host: str = "127.0.0.1",
+    calibration_path: str | Path | None = None,
+    camera_name: str = "head_rgbd_camera",
+    request_port: int = 60000,
+    stream_port: int | None = None,
+    stale_after_s: float = 2.0,
+    startup_timeout_s: float = 15.0,
+) -> CameraBase:
     if source == "mock":
         return MockCamera()
+    if source == "zmq":
+        if calibration_path is None:
+            raise ValueError("ZMQ 相机必须提供 calibration_path")
+        ik_replay_root = Path("/home/robot/yx/project/IK_replay")
+        root = str(ik_replay_root)
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from camera_sources.zmq_rgbd import ZmqRGBDCamera
+
+        return ZmqRGBDCamera(
+            host=host,
+            calibration_path=calibration_path,
+            camera_name=camera_name,
+            request_port=request_port,
+            stream_port=stream_port,
+            stale_after_s=stale_after_s,
+            startup_timeout_s=startup_timeout_s,
+        )
     if source == "orbbec":
         return OrbbecRGBDCamera(serial=serial)
-    raise ValueError(f"未知 camera source: {source!r}（可选 orbbec/mock）")
+    raise ValueError(f"未知 camera source: {source!r}（可选 zmq/orbbec/mock）")
